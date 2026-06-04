@@ -1,3 +1,4 @@
+import asyncio
 import hashlib
 import json
 import logging
@@ -33,11 +34,25 @@ SYSTEM_PROMPT = os.getenv(
     "You are a helpful assistant accessed via LINE messaging app. Keep replies concise (under 500 words).",
 )
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
+CLAUDE_MODE = os.getenv("CLAUDE_MODE", "false").lower() == "true"
+CLAUDE_CWD = os.getenv("CLAUDE_CWD", os.path.expanduser("~"))
+MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
+MEM_CLI = os.getenv("MEM_CLI", "/home/toyofumi/projects/openmemory/scripts/mem")
+CLAUDE_CODE_MODEL = os.getenv("CLAUDE_CODE_MODEL", "")  # e.g. claude-haiku-4-5-20251001; empty = claude default
+# Allowlist of LINE userIds permitted to use CLAUDE_MODE.
+# Leave empty to allow only yourself — get your userId from the LINE Developers
+# Console (Users tab) or from the first webhook log after you message the bot.
+# Example: CLAUDE_ALLOWED_USERS=Uabc123,Udef456
+_raw = os.getenv("CLAUDE_ALLOWED_USERS", "")
+CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip()}
 HISTORY_LIMIT = 10  # rows = 5 user/assistant pairs
 REPLY_MAX_CHARS = 4800
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+logger.info("CLAUDE_MODE=%s  MEMORY_ENABLED=%s  MEM_CLI=%s  CWD=%s",
+            CLAUDE_MODE, MEMORY_ENABLED, MEM_CLI, CLAUDE_CWD)
 
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -161,6 +176,84 @@ async def _call_openrouter(
         return data["choices"][0]["message"]["content"]
 
 
+async def _fetch_memory(query: str) -> str:
+    """Search OpenMemory and return relevant context, or empty string on failure."""
+    if not query.strip():
+        return ""
+    try:
+        safe_query = query.lstrip("-")  # strip leading dashes to prevent flag injection
+        proc = await asyncio.create_subprocess_exec(
+            MEM_CLI, "search", safe_query, "--limit", "5",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=8)
+        result = stdout.decode().strip()
+        err = stderr.decode().strip()
+        logger.info("mem search rc=%s result_len=%d err=%s", proc.returncode, len(result), err[:100] if err else "")
+        return result if result else ""
+    except FileNotFoundError:
+        logger.warning("mem CLI not found at %s", MEM_CLI)
+        return ""
+    except asyncio.TimeoutError:
+        logger.warning("mem CLI timed out")
+        return ""
+    except Exception as e:
+        logger.warning("mem CLI error: %s", e)
+        return ""
+
+
+async def _call_claude_code(user_id: str, text: str) -> str:
+    # Calls the local claude binary. Prompt is passed via stdin, not argv,
+    # to prevent argument injection (flag smuggling via leading dashes).
+    # Only users in CLAUDE_ALLOWED_USERS may reach this function.
+    if CLAUDE_ALLOWED_USERS and user_id not in CLAUDE_ALLOWED_USERS:
+        return "Claude Code mode is restricted to authorised users."
+    memory_ctx = ""
+    if MEMORY_ENABLED:
+        memory_ctx = await _fetch_memory(text)
+
+    parts = []
+    if SYSTEM_PROMPT:
+        parts.append(SYSTEM_PROMPT)
+    if memory_ctx:
+        parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
+    parts.append(text)
+    prompt = "\n\n".join(parts)
+    try:
+        cmd = ["claude", "--print", "--output-format", "text"]
+        if CLAUDE_CODE_MODEL:
+            cmd += ["--model", CLAUDE_CODE_MODEL]
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            cwd=CLAUDE_CWD,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await asyncio.wait_for(
+            proc.communicate(input=prompt.encode()), timeout=110
+        )
+        if proc.returncode != 0:
+            err = stderr.decode().lower()
+            logger.warning("claude exit=%s stderr=%s", proc.returncode, err[:200])
+            if any(k in err for k in ("rate limit", "too many requests", "429")):
+                return "Too many requests. Please try again in a moment."
+            if any(k in err for k in ("overloaded", "capacity", "503", "529")):
+                return "Claude is overloaded right now. Please try again shortly."
+            if any(k in err for k in ("unauthorized", "invalid api key", "401")):
+                return "API key error. Please check the server configuration."
+            if any(k in err for k in ("timeout", "timed out")):
+                return "Request timed out. Please try again."
+            return "Something went wrong. Please try again later."
+        return stdout.decode().strip() or "No response."
+    except asyncio.TimeoutError:
+        proc.kill()
+        return "Taking too long to respond. Please try again."
+    except FileNotFoundError:
+        return "claude binary not found. Is Claude Code installed and on PATH?"
+
+
 def _send_reply(reply_token: str, text: str) -> None:
     text = text[:REPLY_MAX_CHARS]
     with ApiClient(line_config) as api_client:
@@ -226,30 +319,37 @@ async def _handle_text(
 
         # Normal message flow
         model = await _get_model(db, user_id)
-        history = await _get_history(db, user_id)
-        messages = (
-            [{"role": "system", "content": SYSTEM_PROMPT}]
-            + history
-            + [{"role": "user", "content": text}]
-        )
 
-        try:
-            reply_text = await _call_openrouter(model, messages)
-            if not reply_text or not reply_text.strip():
-                reply_text = "Received an empty response."
+        history = await _get_history(db, user_id)
+        if CLAUDE_MODE:
+            model = "claude-code-local"
+            reply_text = await _call_claude_code(user_id, text)
+            if "error" in reply_text.lower()[:20]:
+                outcome = "error"
             await _save_turn(db, user_id, text, reply_text)
-        except httpx.TimeoutException:
-            reply_text = "Sorry, couldn't reach Claude right now (timeout)."
-            outcome = "error"
-        except httpx.HTTPStatusError as e:
-            if e.response.status_code == 429:
-                reply_text = "Rate limited by AI provider. Try again shortly."
-            else:
-                reply_text = f"AI unavailable ({e.response.status_code}). Try again shortly."
-            outcome = "error"
-        except (KeyError, IndexError):
-            reply_text = "Received an empty response from the AI."
-            outcome = "error"
+        else:
+            messages = (
+                [{"role": "system", "content": SYSTEM_PROMPT}]
+                + history
+                + [{"role": "user", "content": text}]
+            )
+            try:
+                reply_text = await _call_openrouter(model, messages)
+                if not reply_text or not reply_text.strip():
+                    reply_text = "Received an empty response."
+                await _save_turn(db, user_id, text, reply_text)
+            except httpx.TimeoutException:
+                reply_text = "Sorry, couldn't reach Claude right now (timeout)."
+                outcome = "error"
+            except httpx.HTTPStatusError as e:
+                if e.response.status_code == 429:
+                    reply_text = "Rate limited by AI provider. Try again shortly."
+                else:
+                    reply_text = f"AI unavailable ({e.response.status_code}). Try again shortly."
+                outcome = "error"
+            except (KeyError, IndexError):
+                reply_text = "Received an empty response from the AI."
+                outcome = "error"
 
         try:
             _send_reply(reply_token, reply_text)

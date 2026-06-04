@@ -1,0 +1,24 @@
+[build-system]
+requires = ["setuptools>=42"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "line-claude-bridge"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "line-bot-sdk>=3.0.0",
+    "fastapi",
+    "uvicorn[standard]",
+    "httpx",
+    "aiosqlite",
+    "slowapi",
+    "python-dotenv",
+    "typer",
+]
+
+[project.scripts]
+line-claude = "cli:app"
+
+[tool.setuptools]
+py-modules = ["cli", "line_claude_bridge"]
