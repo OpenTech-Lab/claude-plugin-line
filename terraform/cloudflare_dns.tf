@@ -1,4 +1,4 @@
-resource "cloudflare_dns_record" "bot" {
+resource "cloudflare_record" "bot" {
   zone_id = var.cloudflare_zone_id
   name    = var.subdomain
   type    = "CNAME"

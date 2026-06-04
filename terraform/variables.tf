@@ -25,3 +25,8 @@ variable "subdomain" {
   type        = string
   default     = "bot"
 }
+
+variable "domain" {
+  description = "Your root domain name (e.g. 'yourdomain.com')"
+  type        = string
+}

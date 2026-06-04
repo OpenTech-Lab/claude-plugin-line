@@ -4,9 +4,6 @@ services:
     env_file: .env
     volumes:
       - ./data:/app/data
-    depends_on:
-      tunnel:
-        condition: service_started
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 30s
@@ -16,6 +13,8 @@ services:
 
   tunnel:
     image: cloudflare/cloudflared:latest
-    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
-    env_file: .env
+    command: tunnel --no-autoupdate --protocol http2 run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    network_mode: "service:bridge"
+    depends_on:
+      - bridge
     restart: unless-stopped

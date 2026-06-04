@@ -1,6 +1,6 @@
 output "webhook_url" {
   description = "Set this as your LINE webhook URL in the LINE Developers Console"
-  value       = "https://${var.subdomain}.${data.cloudflare_zone.domain.name}/webhook"
+  value       = "https://${var.subdomain}.${var.domain}/webhook"
 }
 
 output "tunnel_token" {
