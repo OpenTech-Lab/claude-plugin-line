@@ -1,0 +1,21 @@
+services:
+  bridge:
+    build: .
+    env_file: .env
+    volumes:
+      - ./data:/app/data
+    depends_on:
+      tunnel:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    restart: unless-stopped
+
+  tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    env_file: .env
+    restart: unless-stopped

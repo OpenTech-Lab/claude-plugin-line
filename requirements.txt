@@ -1,0 +1,8 @@
+line-bot-sdk>=3.0.0
+fastapi
+uvicorn[standard]
+httpx
+aiosqlite
+slowapi
+python-dotenv
+pytest-asyncio
