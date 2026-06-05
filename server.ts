@@ -647,11 +647,11 @@ async function handleJoin(source: LineSource): Promise<void> {
   try {
     await query(
       `INSERT INTO pending_tenants (id, type)
-       VALUES ($1, 'group')
+       VALUES ($1, $2)
        ON CONFLICT (id) DO UPDATE
          SET status = 'pending', detected_at = now()
          WHERE pending_tenants.status = 'denied'`,
-      [id],
+      [id, source.type],
     )
   } catch (err) {
     process.stderr.write(`line channel: handleJoin db error: ${err}\n`)
@@ -694,7 +694,8 @@ async function handleLineEvent(event: LineEvent): Promise<void> {
   }
 
   if (event.type === 'follow') {
-    const userId = (event.source as { type: 'user'; userId: string }).userId
+    const src = event.source
+    const userId = src.type === 'user' ? src.userId : undefined
     if (userId) await handleFollow(userId)
     return
   }
