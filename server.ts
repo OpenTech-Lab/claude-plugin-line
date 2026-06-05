@@ -437,6 +437,7 @@ async function handleInbound(
   text:       string,
   replyToken: string,
   timestamp:  number,
+  messageId:  string,
   attachment?: AttachmentMeta,
 ): Promise<void> {
   const result = gate(userId, replyToken)
@@ -495,7 +496,7 @@ async function handleInbound(
   const meta: Record<string, unknown> = {
     source:     'line',
     user_id:    userId,
-    message_id: attachment?.messageId ?? '',
+    message_id: messageId,
     user:       userId,
     ts,
   }
@@ -524,22 +525,22 @@ async function handleLineEvent(event: LineEvent): Promise<void> {
   switch (msg.type) {
     case 'text':
       if (msg.text?.trim())
-        await handleInbound(userId, msg.text.trim(), event.replyToken, event.timestamp)
+        await handleInbound(userId, msg.text.trim(), event.replyToken, event.timestamp, msg.id)
       break
     case 'image':
-      await handleInbound(userId, '(image)', event.replyToken, event.timestamp,
+      await handleInbound(userId, '(image)', event.replyToken, event.timestamp, msg.id,
         { kind: 'image', messageId: msg.id, mime: 'image/jpeg' })
       break
     case 'video':
-      await handleInbound(userId, '(video)', event.replyToken, event.timestamp,
+      await handleInbound(userId, '(video)', event.replyToken, event.timestamp, msg.id,
         { kind: 'video', messageId: msg.id, mime: 'video/mp4' })
       break
     case 'audio':
-      await handleInbound(userId, '(audio)', event.replyToken, event.timestamp,
+      await handleInbound(userId, '(audio)', event.replyToken, event.timestamp, msg.id,
         { kind: 'audio', messageId: msg.id, mime: 'audio/m4a' })
       break
     case 'file':
-      await handleInbound(userId, `(file: ${msg.fileName ?? 'unknown'})`, event.replyToken, event.timestamp,
+      await handleInbound(userId, `(file: ${msg.fileName ?? 'unknown'})`, event.replyToken, event.timestamp, msg.id,
         { kind: 'file', messageId: msg.id, name: msg.fileName, size: msg.fileSize })
       break
   }
