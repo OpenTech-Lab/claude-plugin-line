@@ -1,7 +1,6 @@
-# LINE Bot + Claude Code Bridge
+# LINE Channel for Claude Code
 
-Chat with Claude (via OpenRouter) directly from the LINE mobile app.  
-A FastAPI server receives LINE webhooks and forwards them to OpenRouter, with per-user conversation history in SQLite. A Cloudflare Tunnel provides the public HTTPS endpoint — no port forwarding or ngrok needed.
+Chat with Claude directly from LINE — messages relay through Claude Code via MCP, giving you full tool use (file access, bash, web search) in your LINE conversations.
 
 ## Architecture
 
@@ -12,293 +11,223 @@ LINE User (mobile)
 LINE Messaging API
     │  POST /webhook
     ▼
-Cloudflare Tunnel (cloudflared)
+Cloudflare Tunnel → localhost:8000
     │
     ▼
-FastAPI Bridge (Docker)
-    ├── linebot.v3  — signature validation + reply API
-    ├── aiosqlite   — conversation history per user
-    └── httpx       — async OpenRouter API calls
-```
-
-## Folder Structure
-
-```
-claude-code-line/
-├── line_claude_bridge.py     # FastAPI bridge server
-├── .env                      # secrets (gitignored)
-├── .env.example              # template
-├── requirements.txt
-├── Dockerfile
-├── docker-compose.yml        # bridge + cloudflared services
-├── scripts/
-│   ├── start-bridge.sh       # run without Docker
-│   └── start-tunnel.sh       # quick Cloudflare tunnel (testing)
-├── terraform/                # Cloudflare Tunnel + DNS as code
-│   ├── main.tf
-│   ├── providers.tf
-│   ├── variables.tf
-│   ├── cloudflare_tunnel.tf
-│   ├── cloudflare_dns.tf
-│   ├── outputs.tf
-│   └── terraform.tfvars.example
-└── docs/
-    ├── mvp.md
-    ├── workflow.md
-    ├── cloudflareTunnel.md
-    └── designs/
-        └── line-claude-bridge.md
+server.ts  (Bun + MCP stdio)
+    ├── HTTP webhook server  — validates LINE signature, routes events
+    ├── MCP notifications    — delivers messages to Claude Code
+    └── MCP tools            — reply, download_attachment
+    │
+    ▼
+Claude Code  (full tool use, conversation, reasoning)
+    │
+    ▼
+LINE Push Message API  → LINE User
 ```
 
 ## Prerequisites
 
-- Python 3.11+
-- Docker + Docker Compose (for production)
-- [OpenRouter account](https://openrouter.ai) + API key
+- [Bun](https://bun.sh) runtime (`curl -fsSL https://bun.sh/install | bash`)
+- [Claude Code](https://claude.ai/code) CLI installed and running
 - [LINE Developers account](https://developers.line.biz) with a Messaging API channel
-- `cloudflared` CLI (for testing without Docker)
-- Terraform + a Cloudflare domain (for production tunnel)
+- A public HTTPS URL pointing to `localhost:8000` — Cloudflare Tunnel works well (see below)
 
 ---
 
-## Quick Start (local testing, no Docker)
+## Setup
 
-### 1. Clone and install
-
-```bash
-git clone <this-repo>
-cd claude-code-line
-
-python -m venv venv
-source venv/bin/activate       # Windows: venv\Scripts\activate
-pip install -r requirements.txt
-```
-
-### 2. Configure environment
-
-```bash
-cp .env.example .env
-```
-
-Edit `.env`:
-
-```env
-OPENROUTER_API_KEY=sk-or-v1-...        # from openrouter.ai/keys
-LINE_CHANNEL_SECRET=...                 # LINE Developers Console → Basic settings
-LINE_CHANNEL_ACCESS_TOKEN=...           # LINE Developers Console → Messaging API → Issue token
-CLOUDFLARE_TUNNEL_TOKEN=               # leave blank for quick-tunnel testing
-MODEL=anthropic/claude-haiku-4-5-20251001
-SYSTEM_PROMPT=You are a helpful assistant accessed via LINE messaging app. Keep replies concise.
-```
-
-### 3. Start the bridge
-
-```bash
-mkdir -p data
-uvicorn line_claude_bridge:app --host 0.0.0.0 --port 8000
-
-# Verify it's running:
-curl http://localhost:8000/health
-# → {"status":"ok"}
-```
-
-### 4. Expose with Cloudflare quick tunnel
-
-In a second terminal:
-
-```bash
-# Install cloudflared if you haven't:
-# https://developers.cloudflare.com/cloudflare-one/connections/connect-networks/downloads/
-
-bash scripts/start-tunnel.sh
-# Prints: https://something.trycloudflare.com
-```
-
-Copy the `https://something.trycloudflare.com` URL.
-
-### 5. Configure LINE webhook
+### 1. Get your LINE credentials
 
 1. Go to [LINE Developers Console](https://developers.line.biz)
 2. Select your Messaging API channel
-3. **Messaging API** tab → **Webhook URL**: paste `https://something.trycloudflare.com/webhook`
-4. Click **Verify** — should return success
-5. Enable **Use webhook**
+3. **Basic settings** tab → copy **Channel secret** → this is `LINE_CHANNEL_SECRET`
+4. **Messaging API** tab → **Channel access token** → click **Issue** → copy → this is `LINE_CHANNEL_ACCESS_TOKEN`
 
-Send a message to your bot in LINE. It should reply within ~5 seconds.
+### 2. Save credentials
 
----
+Run in Claude Code:
 
-## Chat Commands
-
-Once the bot is running, send these commands in LINE:
-
-| Command | Effect |
-|---------|--------|
-| `/clear` | Erase your conversation history (fresh context) |
-| `/model <name>` | Switch OpenRouter model, e.g. `/model qwen/qwen3-coder:free` |
-| `/status` | Show current model, history row count, and uptime |
-| (any other text) | Chat with Claude |
-
-### Recommended models on OpenRouter
-
-| Model | Speed | Cost |
-|-------|-------|------|
-| `anthropic/claude-haiku-4-5-20251001` | Fast | Low |
-| `qwen/qwen3-coder:free` | Fast | Free |
-| `google/gemini-2.5-flash` | Very fast | Low |
-| `anthropic/claude-sonnet-4-6` | Slower | Medium |
-
----
-
-## Getting CLOUDFLARE_TUNNEL_TOKEN
-
-There are two ways to create a Cloudflare Tunnel and get the token. Choose one.
-
----
-
-### Option A — Cloudflare Dashboard (simpler, no Terraform)
-
-This is the fastest way to get a permanent tunnel with a custom subdomain.
-
-**Step 1: Install cloudflared**
-
-```bash
-# Linux (amd64)
-wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
-chmod +x cloudflared-linux-amd64
-sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
-
-# Verify
-cloudflared --version
+```
+/line:configure <LINE_CHANNEL_SECRET> <LINE_CHANNEL_ACCESS_TOKEN>
 ```
 
-**Step 2: Create the tunnel in Zero Trust dashboard**
+This writes credentials to `~/.claude/channels/line/.env` (chmod 600).
 
-1. Go to [https://one.dash.cloudflare.com](https://one.dash.cloudflare.com)
-2. Select your account
-3. Left sidebar → **Networks** → **Tunnels**
-4. Click **Create a tunnel**
-5. Choose **Cloudflared** → click Next
-6. Name it `line-claude-bot` → click Save tunnel
-7. On the next screen, Cloudflare shows an install command like:
-
-   ```
-   cloudflared service install eyJhIjoiABC...long_token...XYZ
-   ```
-
-   **Copy the long token** — the part after `cloudflared service install `.  
-   That is your `CLOUDFLARE_TUNNEL_TOKEN`.
-
-8. Paste it into `.env`:
-
-   ```env
-   CLOUDFLARE_TUNNEL_TOKEN=eyJhIjoiABC...long_token...XYZ
-   ```
-
-**Step 3: Set a Public Hostname**
-
-Still in the dashboard (on the same tunnel page):
-
-1. Click the **Public Hostname** tab
-2. Click **Add a public hostname**
-3. Fill in:
-   - **Subdomain**: `bot` (or anything you like)
-   - **Domain**: choose your domain from the dropdown
-   - **Service → Type**: `HTTP`
-   - **URL**: `localhost:8000`
-4. Click **Save**
-
-Your webhook URL is now `https://bot.yourdomain.com/webhook` — use this in LINE Developers Console.
-
-**Step 4: Start the tunnel**
+Or create the file manually:
 
 ```bash
-# The Docker Compose setup runs cloudflared automatically using the token.
-# To test manually without Docker:
-cloudflared tunnel run --token $CLOUDFLARE_TUNNEL_TOKEN
+mkdir -p ~/.claude/channels/line
+cat > ~/.claude/channels/line/.env << 'EOF'
+LINE_CHANNEL_SECRET=your_secret_here
+LINE_CHANNEL_ACCESS_TOKEN=your_token_here
+EOF
+chmod 600 ~/.claude/channels/line/.env
 ```
 
----
+### 3. Register the MCP server
 
-### Option B — Terraform (infrastructure as code)
+Add to `~/.claude/claude.json` under `mcpServers`:
 
-Use this if you want the tunnel managed reproducibly as code.
+```json
+{
+  "mcpServers": {
+    "line": {
+      "command": "bun",
+      "args": ["run", "--cwd", "/path/to/this/directory", "--shell=bun", "start"]
+    }
+  }
+}
+```
+
+Replace `/path/to/this/directory` with the absolute path to this folder.
+
+### 4. Expose port 8000 via Cloudflare Tunnel
+
+The LINE Messaging API requires a public HTTPS webhook URL. Cloudflare Tunnel routes LINE's HTTPS requests to `localhost:8000` on your machine.
+
+**Option A — Cloudflare Dashboard (recommended)**
+
+1. Install `cloudflared`:
+   ```bash
+   # Linux (amd64)
+   wget https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+   chmod +x cloudflared-linux-amd64
+   sudo mv cloudflared-linux-amd64 /usr/local/bin/cloudflared
+   ```
+
+2. Go to [https://one.dash.cloudflare.com](https://one.dash.cloudflare.com) → **Networks** → **Tunnels** → **Create a tunnel**
+3. Name it `line-claude-bot`, copy the token from the install command shown
+4. Add a **Public Hostname**: subdomain `bot`, your domain, service `HTTP`, URL `localhost:8000`
+5. Start the tunnel:
+   ```bash
+   cloudflared tunnel run --token <your_tunnel_token>
+   ```
+
+Your webhook URL: `https://bot.yourdomain.com/webhook`
+
+**Option B — Terraform (infrastructure as code)**
 
 ```bash
 cd terraform
 cp terraform.tfvars.example terraform.tfvars
+# edit terraform.tfvars with your Cloudflare API token, account ID, zone ID
+terraform init && terraform apply
+terraform output webhook_url      # set this in LINE console
+terraform output -raw tunnel_token | cloudflared tunnel run --token -
 ```
 
-Edit `terraform.tfvars` with your Cloudflare credentials:
-
-```hcl
-cloudflare_api_token  = "..."   # see below
-cloudflare_account_id = "..."   # Cloudflare dashboard → right sidebar
-cloudflare_zone_id    = "..."   # Cloudflare dashboard → your domain → right sidebar
-tunnel_name           = "line-claude-bot"
-subdomain             = "bot"
-```
-
-**Getting the API token:**
-
-1. [Cloudflare dashboard](https://dash.cloudflare.com) → top-right avatar → **My Profile**
-2. **API Tokens** → **Create Token**
-3. Use the **Edit zone DNS** template, then also add:
-   - **Account** → *Cloudflare Tunnel* → **Edit**
-4. Click **Continue to summary** → **Create Token**
-5. Copy the token (shown only once)
-
-**Run Terraform:**
+**Option C — Quick tunnel (testing only, URL changes on restart)**
 
 ```bash
-terraform init
-terraform plan     # preview — should show 3 resources
-terraform apply    # creates tunnel + DNS record
+cloudflared tunnel --url http://localhost:8000
+# Prints: https://something.trycloudflare.com
 ```
 
-**Get your token and webhook URL:**
+### 5. Set the LINE webhook URL
+
+1. [LINE Developers Console](https://developers.line.biz) → your channel → **Messaging API** tab
+2. **Webhook URL**: `https://bot.yourdomain.com/webhook`
+3. Click **Verify** — should return success
+4. Enable **Use webhook**
+
+### 6. Restart Claude Code
+
+The MCP server starts automatically. Verify it's running:
 
 ```bash
-terraform output -raw tunnel_token   # paste into .env as CLOUDFLARE_TUNNEL_TOKEN
-terraform output webhook_url         # set this in LINE Developers Console
-```
-
----
-
-## Production Setup (Docker)
-
-### 1. Get CLOUDFLARE_TUNNEL_TOKEN
-
-Follow **Option A** (dashboard) or **Option B** (Terraform) above.  
-Make sure `CLOUDFLARE_TUNNEL_TOKEN` is set in `.env` before starting.
-
-### 2. Start with Docker Compose
-
-```bash
-docker compose up --build -d
-
-# Check logs
-docker compose logs -f bridge
-docker compose logs -f tunnel
-```
-
-The bridge auto-restarts on reboot (`restart: unless-stopped`).  
-Conversation history persists in `./data/conversations.db`.
-
-### 3. Verify
-
-```bash
-curl https://<your-subdomain>.<your-domain>/health
+curl http://localhost:8000/health
 # → {"status":"ok"}
 ```
 
-Send a test message from LINE.
+### 7. Pair your LINE account
+
+Message your LINE bot from your phone. It replies with a pairing code:
+
+```
+Pairing required — run this in your Claude Code terminal:
+
+/line:access pair a1b2c3
+```
+
+Run the command in Claude Code. Within 5 seconds your LINE app shows:
+
+```
+Paired! Say hi to Claude.
+```
+
+You're ready — send messages from LINE and Claude Code responds.
 
 ---
 
-## Upgrade: Claude Code Native (Approach C)
+## Slash Commands
 
-The current bridge calls OpenRouter's API. For full Claude Code tool use (file access, bash, MCP) through LINE, see `docs/designs/line-claude-bridge.md` — "Approach C" section.
+Once the MCP server is running, manage access from Claude Code:
+
+| Command | Effect |
+|---------|--------|
+| `/line:configure` | Show credentials status and access summary |
+| `/line:configure <secret> <token>` | Save LINE credentials |
+| `/line:access` | Show who's paired and DM policy |
+| `/line:access pair <code>` | Approve a pairing request |
+| `/line:access deny <code>` | Reject a pairing request |
+| `/line:access allow <userId>` | Add a LINE userId directly |
+| `/line:access remove <userId>` | Remove from allowlist |
+| `/line:access policy pairing\|allowlist\|disabled` | Change DM policy |
+
+### DM policies
+
+| Policy | Behavior |
+|--------|----------|
+| `pairing` (default) | Unknown senders get a pairing code; approved senders reach Claude |
+| `allowlist` | Only explicitly allowed userIds; unknown senders silently dropped |
+| `disabled` | All inbound messages dropped |
+
+After pairing everyone you want, lock it down:
+```
+/line:access policy allowlist
+```
+
+---
+
+## State Files
+
+All state lives in `~/.claude/channels/line/` (outside this repo):
+
+| File | Contents |
+|------|----------|
+| `.env` | LINE credentials (chmod 600) |
+| `access.json` | DM policy, allowlist, pending pairings |
+| `inbox/` | Downloaded media attachments |
+| `approved/` | Transient pairing approval markers |
+
+---
+
+## Message Types
+
+The server relays these LINE message types to Claude Code:
+
+| Type | What Claude sees |
+|------|-----------------|
+| Text | The message text |
+| Image | `(image)` + `image_path` pointing to downloaded file |
+| Video | `(video)` + `attachment_message_id` for download |
+| Audio | `(audio)` + `attachment_message_id` |
+| File | `(file: filename.ext)` + `attachment_message_id` |
+
+Use the `download_attachment` MCP tool to fetch video/audio/file to the local inbox.
+
+---
+
+## Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `LINE_CHANNEL_SECRET` | — | Required. From LINE Developers Console |
+| `LINE_CHANNEL_ACCESS_TOKEN` | — | Required. From LINE Developers Console |
+| `LINE_WEBHOOK_PORT` | `8000` | HTTP port for webhook server |
+| `LINE_STATE_DIR` | `~/.claude/channels/line` | State directory |
+| `LINE_ACCESS_MODE` | — | Set to `static` to lock access.json at boot |
 
 ---
 
@@ -306,9 +235,10 @@ The current bridge calls OpenRouter's API. For full Claude Code tool use (file a
 
 | Problem | Fix |
 |---------|-----|
-| `linebot.v3` import error | Install `line-bot-sdk>=3.0.0`, not `linebot.v3` |
-| Webhook verify fails in LINE console | Check `LINE_CHANNEL_SECRET` in `.env` |
-| Bot doesn't reply | Check `LINE_CHANNEL_ACCESS_TOKEN`; check `docker compose logs bridge` |
-| 429 from OpenRouter | Switch to a faster/free model with `/model qwen/qwen3-coder:free` |
-| Tunnel URL changes on restart | Use Terraform-managed tunnel for a permanent subdomain |
-| `No matching distribution for linebot.v3` | Use `line-bot-sdk>=3.0.0` in requirements.txt |
+| Webhook verify fails in LINE console | Check `LINE_CHANNEL_SECRET` in `~/.claude/channels/line/.env` |
+| Bot doesn't reply | Check `LINE_CHANNEL_ACCESS_TOKEN`; check Claude Code MCP server logs |
+| Server not starting | Run `bun install` in this directory; check `bun --version` ≥ 1.0 |
+| Port 8000 already in use | Stop old Python bridge: `pkill -f uvicorn` or `docker compose stop` |
+| `curl /health` returns nothing | Claude Code session not started; MCP server hasn't launched yet |
+| Pairing code not received | Check Cloudflare tunnel is running and webhook URL is set in LINE console |
+| `access.json corrupt` warning | The server moved the bad file to `access.json.corrupt-<timestamp>` and reset; re-pair |
