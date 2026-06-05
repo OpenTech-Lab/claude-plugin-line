@@ -1,0 +1,9 @@
+{
+  "name": "line",
+  "description": "LINE messaging channel for Claude Code with built-in access control. Manage pairing and allowlists via /line:access.",
+  "version": "0.0.1",
+  "author": { "name": "toyofumi", "email": "toyofumi1223@gmail.com" },
+  "license": "MIT",
+  "keywords": ["line", "messaging", "channel", "mcp"],
+  "skills": "./skills/"
+}
