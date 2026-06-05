@@ -30,7 +30,13 @@ export default function PendingPage() {
     }
   }
 
-  useEffect(() => { load() }, [])
+  useEffect(() => {
+    void (async () => {
+      const res = await fetch('/api/pending')
+      if (res.ok) setRows(await res.json())
+      setLoading(false)
+    })()
+  }, [])
 
   async function act(id: string, action: 'approve' | 'deny') {
     setWorking(id + action)
