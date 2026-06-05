@@ -17,6 +17,7 @@ import {
 import { homedir } from 'os'
 import { join } from 'path'
 import { enrichContext, autoRegisterTenant } from './lib/tenant.ts'
+import { query } from './lib/db.ts'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -637,9 +638,68 @@ async function handleGroupInbound(
     .catch(e => process.stderr.write(`line channel: group notification failed: ${e}\n`))
 }
 
+async function handleJoin(source: LineSource): Promise<void> {
+  const id = source.type === 'group' ? source.groupId
+           : source.type === 'room'  ? (source as { type: 'room'; roomId: string }).roomId
+           : null
+  if (!id) return
+
+  try {
+    await query(
+      `INSERT INTO pending_tenants (id, type)
+       VALUES ($1, 'group')
+       ON CONFLICT (id) DO UPDATE
+         SET status = 'pending', detected_at = now()
+         WHERE pending_tenants.status = 'denied'`,
+      [id],
+    )
+  } catch (err) {
+    process.stderr.write(`line channel: handleJoin db error: ${err}\n`)
+  }
+
+  const notice = `Bot added to ${source.type} ${id}\n\nApprove or deny at http://localhost:3001/pending`
+  const access = loadAccess()
+  for (const uid of access.allowFrom) {
+    void linePush(uid, [{ type: 'text', text: notice }]).catch(() => {})
+  }
+}
+
+async function handleFollow(userId: string): Promise<void> {
+  try {
+    await query(
+      `INSERT INTO pending_tenants (id, type)
+       VALUES ($1, 'user')
+       ON CONFLICT (id) DO UPDATE
+         SET status = 'pending', detected_at = now()
+         WHERE pending_tenants.status = 'denied'`,
+      [userId],
+    )
+  } catch (err) {
+    process.stderr.write(`line channel: handleFollow db error: ${err}\n`)
+  }
+
+  const notice = `New user followed bot: ${userId}\n\nApprove or deny at http://localhost:3001/pending`
+  const access = loadAccess()
+  for (const uid of access.allowFrom) {
+    void linePush(uid, [{ type: 'text', text: notice }]).catch(() => {})
+  }
+}
+
 async function handleLineEvent(event: LineEvent): Promise<void> {
+  if (event.mode !== 'active') return
+
+  if (event.type === 'join') {
+    await handleJoin(event.source)
+    return
+  }
+
+  if (event.type === 'follow') {
+    const userId = (event.source as { type: 'user'; userId: string }).userId
+    if (userId) await handleFollow(userId)
+    return
+  }
+
   if (event.type !== 'message') return
-  if (event.mode !== 'active')  return
 
   const src = event.source
   const msg = event.message
