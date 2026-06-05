@@ -12,3 +12,5 @@ __pycache__/
 .terraform.lock.hcl
 venv
 line_claude_bridge.egg-info
+
+node_modules/

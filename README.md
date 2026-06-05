@@ -23,13 +23,13 @@ server.ts  (Bun + MCP stdio)
 Claude Code  (full tool use, conversation, reasoning)
     │
     ▼
-LINE Push Message API  → LINE User
+LINE Push Message API  → LINE User / Group
 ```
 
 ## Prerequisites
 
 - [Bun](https://bun.sh) runtime (`curl -fsSL https://bun.sh/install | bash`)
-- [Claude Code](https://claude.ai/code) CLI installed and running
+- [Claude Code](https://claude.ai/code) CLI installed and authenticated
 - [LINE Developers account](https://developers.line.biz) with a Messaging API channel
 - A public HTTPS URL pointing to `localhost:8000` — Cloudflare Tunnel works well (see below)
 
@@ -65,24 +65,7 @@ EOF
 chmod 600 ~/.claude/channels/line/.env
 ```
 
-### 3. Register the MCP server
-
-Add to `~/.claude/claude.json` under `mcpServers`:
-
-```json
-{
-  "mcpServers": {
-    "line": {
-      "command": "bun",
-      "args": ["run", "--cwd", "/path/to/this/directory", "--shell=bun", "start"]
-    }
-  }
-}
-```
-
-Replace `/path/to/this/directory` with the absolute path to this folder.
-
-### 4. Expose port 8000 via Cloudflare Tunnel
+### 3. Expose port 8000 via Cloudflare Tunnel
 
 The LINE Messaging API requires a public HTTPS webhook URL. Cloudflare Tunnel routes LINE's HTTPS requests to `localhost:8000` on your machine.
 
@@ -101,7 +84,7 @@ The LINE Messaging API requires a public HTTPS webhook URL. Cloudflare Tunnel ro
 4. Add a **Public Hostname**: subdomain `bot`, your domain, service `HTTP`, URL `localhost:8000`
 5. Start the tunnel:
    ```bash
-   cloudflared tunnel run --token <your_tunnel_token>
+   cloudflared tunnel run --protocol http2 --token <your_tunnel_token>
    ```
 
 Your webhook URL: `https://bot.yourdomain.com/webhook`
@@ -113,8 +96,12 @@ cd terraform
 cp terraform.tfvars.example terraform.tfvars
 # edit terraform.tfvars with your Cloudflare API token, account ID, zone ID
 terraform init && terraform apply
-terraform output webhook_url      # set this in LINE console
-terraform output -raw tunnel_token | cloudflared tunnel run --token -
+terraform output webhook_url   # set this in LINE console
+```
+
+Start the tunnel:
+```bash
+cloudflared tunnel run --protocol http2 --token $(terraform output -raw tunnel_token)
 ```
 
 **Option C — Quick tunnel (testing only, URL changes on restart)**
@@ -124,23 +111,33 @@ cloudflared tunnel --url http://localhost:8000
 # Prints: https://something.trycloudflare.com
 ```
 
-### 5. Set the LINE webhook URL
+### 4. Set the LINE webhook URL
 
 1. [LINE Developers Console](https://developers.line.biz) → your channel → **Messaging API** tab
 2. **Webhook URL**: `https://bot.yourdomain.com/webhook`
 3. Click **Verify** — should return success
 4. Enable **Use webhook**
 
-### 6. Restart Claude Code
+### 5. Start the LINE channel listener
 
-The MCP server starts automatically. Verify it's running:
+In a **dedicated terminal**, run:
+
+```bash
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:line@personal
+```
+
+This starts Claude Code in channel-only mode — no interactive session, just LINE message handling. Leave this terminal running.
+
+Verify the MCP server is up:
 
 ```bash
 curl http://localhost:8000/health
 # → {"status":"ok"}
 ```
 
-### 7. Pair your LINE account
+> **Note:** `--dangerously-load-development-channels` both registers the channel **and** bypasses the plugin allowlist. Pass the channel name to this flag only — do **not** also pass `--channels`, which creates a duplicate non-dev entry that fails with "not on the approved channels allowlist". The `allowedChannelPlugins` setting in settings.json is enterprise-only and has no effect for personal plugins.
+
+### 6. Pair your LINE account
 
 Message your LINE bot from your phone. It replies with a pairing code:
 
@@ -160,20 +157,61 @@ You're ready — send messages from LINE and Claude Code responds.
 
 ---
 
-## Slash Commands
+## Group chats
 
-Once the MCP server is running, manage access from Claude Code:
+### Enable group support in LINE console
+
+Before adding the bot to a group, make sure **"Allow bot to join group chats"** is enabled:
+
+1. [LINE Developers Console](https://developers.line.biz) → your channel → **Messaging API** tab
+2. **Features** section → **Group and multi-person chats** → enable
+
+### Add the bot to a group
+
+1. Open LINE → the group → Members → Invite → select your bot
+2. Send any message in the group
+3. The bot sends you a **personal DM** with the group ID and the exact command to run:
+
+```
+Unknown group wants to chat:
+Group ID: C1234567890abcdef
+
+Run in Claude Code terminal:
+/line:access allow-group C1234567890abcdef
+```
+
+4. Run that command in Claude Code:
+
+```
+/line:access allow-group C1234567890abcdef
+```
+
+By default the bot only responds when @mentioned (`groupTrigger: mention`). Change this with:
+
+```
+/line:access group-trigger all      # respond to every message
+/line:access group-trigger prefix   # only messages starting with !
+/line:access group-prefix /ask      # custom prefix
+```
+
+---
+
+## Slash Commands
 
 | Command | Effect |
 |---------|--------|
 | `/line:configure` | Show credentials status and access summary |
 | `/line:configure <secret> <token>` | Save LINE credentials |
-| `/line:access` | Show who's paired and DM policy |
+| `/line:access` | Show who's paired, DM policy, and group allowlist |
 | `/line:access pair <code>` | Approve a pairing request |
 | `/line:access deny <code>` | Reject a pairing request |
 | `/line:access allow <userId>` | Add a LINE userId directly |
-| `/line:access remove <userId>` | Remove from allowlist |
+| `/line:access remove <userId>` | Remove from DM allowlist |
 | `/line:access policy pairing\|allowlist\|disabled` | Change DM policy |
+| `/line:access allow-group <groupId>` | Add a LINE group to the group allowlist |
+| `/line:access remove-group <groupId>` | Remove a group from the allowlist |
+| `/line:access group-trigger mention\|all\|prefix` | Set group trigger mode |
+| `/line:access group-prefix <string>` | Set prefix for `prefix` trigger mode |
 
 ### DM policies
 
@@ -188,6 +226,14 @@ After pairing everyone you want, lock it down:
 /line:access policy allowlist
 ```
 
+### Group trigger modes
+
+| Mode | Behavior |
+|------|----------|
+| `mention` (default) | Only when the bot is @mentioned |
+| `all` | Every message in the group |
+| `prefix` | Only messages starting with the configured prefix (default `!`) |
+
 ---
 
 ## State Files
@@ -197,7 +243,7 @@ All state lives in `~/.claude/channels/line/` (outside this repo):
 | File | Contents |
 |------|----------|
 | `.env` | LINE credentials (chmod 600) |
-| `access.json` | DM policy, allowlist, pending pairings |
+| `access.json` | DM policy, allowlist, pending pairings, group allowlist + trigger |
 | `inbox/` | Downloaded media attachments |
 | `approved/` | Transient pairing approval markers |
 
@@ -228,6 +274,7 @@ Use the `download_attachment` MCP tool to fetch video/audio/file to the local in
 | `LINE_WEBHOOK_PORT` | `8000` | HTTP port for webhook server |
 | `LINE_STATE_DIR` | `~/.claude/channels/line` | State directory |
 | `LINE_ACCESS_MODE` | — | Set to `static` to lock access.json at boot |
+| `LINE_DEBUG` | — | Set to `1` to log all webhook payloads to `debug.log` |
 
 ---
 
@@ -236,9 +283,15 @@ Use the `download_attachment` MCP tool to fetch video/audio/file to the local in
 | Problem | Fix |
 |---------|-----|
 | Webhook verify fails in LINE console | Check `LINE_CHANNEL_SECRET` in `~/.claude/channels/line/.env` |
-| Bot doesn't reply | Check `LINE_CHANNEL_ACCESS_TOKEN`; check Claude Code MCP server logs |
+| Bot doesn't reply | Check `LINE_CHANNEL_ACCESS_TOKEN`; check that the channel listener is running |
 | Server not starting | Run `bun install` in this directory; check `bun --version` ≥ 1.0 |
-| Port 8000 already in use | Stop old Python bridge: `pkill -f uvicorn` or `docker compose stop` |
-| `curl /health` returns nothing | Claude Code session not started; MCP server hasn't launched yet |
-| Pairing code not received | Check Cloudflare tunnel is running and webhook URL is set in LINE console |
-| `access.json corrupt` warning | The server moved the bad file to `access.json.corrupt-<timestamp>` and reset; re-pair |
+| Port 8000 already in use | Kill the old process: `lsof -ti :8000 \| xargs kill` |
+| `curl /health` returns nothing | Channel listener not running; see step 5 |
+| Bot receives messages but never replies | Channel listener not running; see step 5 |
+| `not on the approved channels allowlist` | Pass the channel to `--dangerously-load-development-channels` **only** — no separate `--channels` flag |
+| `entries must be tagged` | The channel name must come right after `--dangerously-load-development-channels` with no flags in between |
+| QUIC timeout errors in cloudflared | Add `--protocol http2` to force TCP |
+| Pairing code not received | Check tunnel is running and webhook URL is set + verified in LINE console |
+| Bot added to group but no response | Check "Allow bot to join group chats" is enabled in LINE Developers Console; run `/line:access allow-group <id>` |
+| Group ID unknown | Send any message in the group — the bot sends you a personal DM with the group ID |
+| `access.json corrupt` warning | Server moved bad file to `access.json.corrupt-<timestamp>` and reset; re-pair |

@@ -1,6 +1,6 @@
 ---
 name: access
-description: Manage LINE channel access — approve pairings, edit allowlists, set DM policy. Use when the user runs /line:access pair, allow, remove, policy, or wants to see who's connected.
+description: Manage LINE channel access — approve pairings, edit allowlists, set DM policy, manage group allowlist and trigger mode. Use when the user runs /line:access pair, allow, remove, policy, allow-group, remove-group, group-trigger, or wants to see who's connected.
 user-invocable: true
 allowed-tools:
   - Read
@@ -21,17 +21,24 @@ State: `~/.claude/channels/line/access.json`
   "allowFrom": ["Uf1234567890abcdef"],
   "pending": {
     "a1b2c3": { "senderId": "Uf...", "createdAt": 1234567890000, "expiresAt": 1234571490000, "replies": 1 }
-  }
+  },
+  "groups": ["C1234567890abcdef"],
+  "groupTrigger": "mention"
 }
 ```
 
-Missing file = defaults (`dmPolicy: "pairing"`, empty allowFrom, empty pending).
+Missing file = defaults (`dmPolicy: "pairing"`, empty allowFrom, empty pending, empty groups, groupTrigger: "mention").
 
 Arguments: `$ARGUMENTS`
 
 ## No args — status
 
-Read access.json, show: dmPolicy, allowFrom list, pending entries with codes + sender IDs + age in minutes.
+Read access.json, show:
+- dmPolicy and its meaning
+- allowFrom list (DM allowlist)
+- pending entries with codes + sender IDs + age in minutes
+- groups list (group allowlist)
+- groupTrigger mode and groupPrefix (if set)
 
 ## `pair <code>`
 
@@ -57,6 +64,34 @@ Read, filter `allowFrom` to exclude `<userId>`, write.
 
 Validate `<mode>` is one of `pairing`, `allowlist`, `disabled`. Read, set `dmPolicy`, write.
 
+## `allow-group <groupId>`
+
+Add a LINE group to the group allowlist. LINE group IDs start with `C` (e.g. `Cabcdef1234...`).
+
+Read access.json (create default if missing), add `<groupId>` to `groups` (dedupe), write back.
+Confirm what was added and remind the user that the bot must already be a member of the group, and that `groupTrigger` (currently shown) controls when it responds.
+
+## `remove-group <groupId>`
+
+Read access.json, filter `groups` to exclude `<groupId>`, write back.
+
+## `group-trigger <mode>`
+
+Set how the bot decides to respond in groups.
+
+Valid modes:
+- `mention` — only when @mentioned (default; recommended for busy groups)
+- `all` — respond to every message in allowed groups
+- `prefix` — only messages starting with a prefix (default `!`; set with `group-prefix`)
+
+Read, set `groupTrigger`, write back.
+
+## `group-prefix <string>`
+
+Set the prefix for `prefix` trigger mode. Example: `group-prefix /ask`.
+
+Read, set `groupPrefix`, write back. Confirm the new prefix.
+
 ## `set <key> <value>`
 
 Supported keys: `ackEnabled` (true/false), `textChunkLimit` (number, max 5000).
@@ -67,3 +102,4 @@ Read, set the key, write.
 - Always Read before Write — the server may have added pending entries since you last read.
 - Pretty-print JSON (2-space indent).
 - Pairing always requires a code. If the user says "approve the pairing" without one, list pending entries and ask which code.
+- To find a group's ID: add the bot to the group, send any message, and check the server logs — the groupId appears in `line channel: group notification failed` or in the webhook payload. Alternatively enable `groupTrigger: all` temporarily, send a message, Claude will see `group_id` in the channel tag.
