@@ -185,6 +185,7 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
   const [title, setTitle] = useState('')
   const [content, setContent] = useState('')
   const [fileType, setFileType] = useState('text')
+  const [pdfFile, setPdfFile] = useState<File | null>(null)
   const [adding, setAdding] = useState(false)
   const [addNotice, setAddNotice] = useState<{ type: 'success' | 'error'; msg: string } | null>(
     null
@@ -225,27 +226,44 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
   async function handleAddDoc(e: React.FormEvent) {
     e.preventDefault()
     setAddNotice(null)
-    if (!title.trim() || !content.trim()) {
+
+    if (fileType === 'pdf') {
+      if (!title.trim() || !pdfFile) {
+        setAddNotice({ type: 'error', msg: 'Title and a PDF file are required.' })
+        return
+      }
+    } else if (!title.trim() || !content.trim()) {
       setAddNotice({ type: 'error', msg: 'Title and content are required.' })
       return
     }
+
     setAdding(true)
     try {
-      const res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ title: title.trim(), content: content.trim(), file_type: fileType }),
-      })
+      let res: Response
+      if (fileType === 'pdf' && pdfFile) {
+        const form = new FormData()
+        form.append('title', title.trim())
+        form.append('file_type', 'pdf')
+        form.append('file', pdfFile)
+        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
+          method: 'POST',
+          body: form,
+        })
+      } else {
+        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ title: title.trim(), content: content.trim(), file_type: fileType }),
+        })
+      }
       const data = await res.json()
       if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
       setDocs((prev) => [data, ...prev])
       setTitle('')
       setContent('')
+      setPdfFile(null)
       setFileType('text')
-      setAddNotice({
-        type: 'success',
-        msg: 'Document added.',
-      })
+      setAddNotice({ type: 'success', msg: 'Document added.' })
     } catch (err) {
       setAddNotice({ type: 'error', msg: err instanceof Error ? err.message : String(err) })
     } finally {
@@ -329,7 +347,7 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
             </div>
             <div className="flex-1 min-w-[120px] space-y-1.5">
               <Label htmlFor="doc-type">File Type</Label>
-              <Select value={fileType} onValueChange={(v) => v && setFileType(v)}>
+              <Select value={fileType} onValueChange={(v) => { if (v) { setFileType(v); setPdfFile(null) } }}>
                 <SelectTrigger id="doc-type" className="w-full">
                   <SelectValue />
                 </SelectTrigger>
@@ -341,16 +359,32 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
               </Select>
             </div>
           </div>
-          <div className="space-y-1.5">
-            <Label htmlFor="doc-content">Content *</Label>
-            <Textarea
-              id="doc-content"
-              className="min-h-[160px] font-mono text-sm"
-              value={content}
-              onChange={(e) => setContent(e.target.value)}
-              placeholder="Paste document content here…"
-            />
-          </div>
+          {fileType === 'pdf' ? (
+            <div className="space-y-1.5">
+              <Label htmlFor="doc-file">PDF File *</Label>
+              <Input
+                id="doc-file"
+                type="file"
+                accept=".pdf,application/pdf"
+                onChange={(e) => setPdfFile(e.target.files?.[0] ?? null)}
+                className="cursor-pointer"
+              />
+              {pdfFile && (
+                <p className="text-xs text-muted-foreground">{pdfFile.name} ({(pdfFile.size / 1024).toFixed(0)} KB)</p>
+              )}
+            </div>
+          ) : (
+            <div className="space-y-1.5">
+              <Label htmlFor="doc-content">Content *</Label>
+              <Textarea
+                id="doc-content"
+                className="min-h-[160px] font-mono text-sm"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+                placeholder="Paste document content here…"
+              />
+            </div>
+          )}
           <Button type="submit" disabled={adding}>
             {adding ? 'Saving…' : 'Save Document'}
           </Button>
