@@ -36,16 +36,6 @@ export async function POST(
     }
     const { type } = row.rows[0] as { type: string }
 
-    const access = readAccess()
-    if (type === 'group') {
-      if (!Array.isArray(access.groups)) access.groups = []
-      if (!access.groups.includes(id)) access.groups.push(id)
-    } else {
-      if (!Array.isArray(access.allowFrom)) access.allowFrom = []
-      if (!access.allowFrom.includes(id)) access.allowFrom.push(id)
-    }
-    saveAccess(access)
-
     await query(
       'INSERT INTO tenants (id, type) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING',
       [id, type],
@@ -55,6 +45,16 @@ export async function POST(
       "UPDATE pending_tenants SET status = 'approved' WHERE id = $1",
       [id],
     )
+
+    const access = readAccess()
+    if (type === 'group' || type === 'room') {
+      if (!Array.isArray(access.groups)) access.groups = []
+      if (!access.groups.includes(id)) access.groups.push(id)
+    } else if (type === 'user') {
+      if (!Array.isArray(access.allowFrom)) access.allowFrom = []
+      if (!access.allowFrom.includes(id)) access.allowFrom.push(id)
+    }
+    saveAccess(access)
 
     return NextResponse.json({ ok: true })
   } catch (err) {

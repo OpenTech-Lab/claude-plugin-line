@@ -651,7 +651,7 @@ async function handleJoin(source: LineSource): Promise<void> {
        ON CONFLICT (id) DO UPDATE
          SET status = 'pending', detected_at = now()
          WHERE pending_tenants.status = 'denied'`,
-      [id, source.type],
+      [id, source.type === 'room' ? 'group' : source.type],
     )
   } catch (err) {
     process.stderr.write(`line channel: handleJoin db error: ${err}\n`)

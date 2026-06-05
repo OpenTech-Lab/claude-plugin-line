@@ -19,6 +19,7 @@ export default function PendingPage() {
   const [rows, setRows]       = useState<PendingTenant[]>([])
   const [loading, setLoading] = useState(true)
   const [working, setWorking] = useState<string | null>(null)
+  const [error, setError]     = useState<string | null>(null)
 
   async function load() {
     setLoading(true)
@@ -31,17 +32,23 @@ export default function PendingPage() {
   }
 
   useEffect(() => {
-    void (async () => {
-      const res = await fetch('/api/pending')
-      if (res.ok) setRows(await res.json())
-      setLoading(false)
-    })()
+    fetch('/api/pending')
+      .then(r => r.ok ? r.json() : Promise.reject(r))
+      .then((data: PendingTenant[]) => setRows(data))
+      .catch(() => {})
+      .finally(() => setLoading(false))
   }, [])
 
   async function act(id: string, action: 'approve' | 'deny') {
     setWorking(id + action)
+    setError(null)
     try {
-      await fetch(`/api/pending/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      const res = await fetch(`/api/pending/${encodeURIComponent(id)}/${action}`, { method: 'POST' })
+      if (!res.ok) {
+        const body = await res.json().catch(() => ({}))
+        setError(body.error ?? `Failed to ${action}`)
+        return
+      }
       await load()
     } finally {
       setWorking(null)
@@ -51,6 +58,11 @@ export default function PendingPage() {
   return (
     <div className="p-6">
       <h1 className="text-2xl font-semibold mb-6">Pending Approvals</h1>
+      {error && (
+        <p className="mb-4 text-sm text-red-600 bg-red-50 border border-red-200 rounded px-3 py-2">
+          {error}
+        </p>
+      )}
       <Card>
         <CardHeader>
           <CardTitle>Awaiting Review</CardTitle>
