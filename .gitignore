@@ -1,4 +1,6 @@
 .env
+.env.local
+.env.*.local
 terraform/terraform.tfvars
 *.db
 data/
@@ -14,3 +16,6 @@ venv
 line_claude_bridge.egg-info
 
 node_modules/
+
+# Internal planning docs (contain local machine paths)
+docs/superpowers/

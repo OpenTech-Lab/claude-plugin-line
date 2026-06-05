@@ -1,7 +1,11 @@
 import { Pool } from 'pg'
 
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL environment variable is required')
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL || 'postgresql://linebot:linebot@localhost:5433/linebot',
+  connectionString: process.env.DATABASE_URL,
 })
 
 export async function query(text: string, params?: unknown[]) {

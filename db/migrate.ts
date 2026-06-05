@@ -2,8 +2,11 @@ import { readFileSync } from "fs";
 import { resolve } from "path";
 import { Client } from "pg";
 
-const DATABASE_URL =
-  process.env.DATABASE_URL || "postgresql://linebot:linebot@localhost:5433/linebot";
+const DATABASE_URL = process.env.DATABASE_URL;
+if (!DATABASE_URL) {
+  console.error("DATABASE_URL environment variable is required");
+  process.exit(1);
+}
 
 async function migrate() {
   const client = new Client({

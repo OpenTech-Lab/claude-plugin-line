@@ -1,8 +1,12 @@
 import pkg from 'pg';
 const { Pool } = pkg;
 
+if (!process.env.DATABASE_URL) {
+  throw new Error('DATABASE_URL environment variable is required');
+}
+
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL ?? 'postgresql://linebot:linebot@localhost:5433/linebot',
+  connectionString: process.env.DATABASE_URL,
 });
 
 pool.on('error', (err) => {
