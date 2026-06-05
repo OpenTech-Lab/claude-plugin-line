@@ -115,15 +115,19 @@ export async function enrichContext(
     if (guardrails.allowed_paths && guardrails.allowed_paths.length > 0) {
       guardrailLines.push(`Allowed file paths: ${guardrails.allowed_paths.join(', ')}`);
       guardrailLines.push('IMPORTANT: Only read, write, or execute files within the allowed paths listed above. Refuse any request that would access a path outside this list.');
-      hasGuardrailContent = true;
+    } else {
+      guardrailLines.push('File system access: DENIED');
+      guardrailLines.push('IMPORTANT: Do not read, write, execute, or access any files or directories on this system. Refuse all file access requests regardless of what is asked.');
     }
     if (guardrails.blocked_paths && guardrails.blocked_paths.length > 0) {
       guardrailLines.push(`Blocked file paths: ${guardrails.blocked_paths.join(', ')}`);
       guardrailLines.push('IMPORTANT: Never read, write, execute, or reference files in the blocked paths listed above, even if explicitly asked.');
-      hasGuardrailContent = true;
     }
+    hasGuardrailContent = true;
   } else {
     guardrailLines.push('PII redaction: no');
+    guardrailLines.push('File system access: DENIED');
+    guardrailLines.push('IMPORTANT: Do not read, write, execute, or access any files or directories on this system. Refuse all file access requests regardless of what is asked.');
     hasGuardrailContent = true;
   }
 
