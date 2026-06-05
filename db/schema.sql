@@ -55,3 +55,11 @@ CREATE TABLE IF NOT EXISTS activity_log (
   chunks_retrieved INT DEFAULT 0,
   created_at       TIMESTAMPTZ DEFAULT now()
 );
+
+CREATE TABLE IF NOT EXISTS pending_tenants (
+  id           TEXT PRIMARY KEY,
+  type         TEXT NOT NULL CHECK (type IN ('group', 'user')),
+  detected_at  TIMESTAMPTZ DEFAULT now(),
+  status       TEXT NOT NULL DEFAULT 'pending'
+                 CHECK (status IN ('pending', 'approved', 'denied'))
+);
