@@ -1,6 +1,7 @@
 'use client'
 
 import './globals.css'
+import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
 import { Geist } from 'next/font/google'
@@ -8,8 +9,24 @@ import { cn } from '@/lib/utils'
 
 const geist = Geist({ subsets: ['latin'], variable: '--font-sans' })
 
+function usePendingCount() {
+  const [count, setCount] = useState(0)
+  useEffect(() => {
+    const load = () =>
+      fetch('/api/pending')
+        .then(r => r.json())
+        .then(rows => setCount(Array.isArray(rows) ? rows.length : 0))
+        .catch(() => {})
+    load()
+    const t = setInterval(load, 30_000)
+    return () => clearInterval(t)
+  }, [])
+  return count
+}
+
 function Sidebar() {
   const pathname = usePathname()
+  const pendingCount = usePendingCount()
 
   function isActive(href: string) {
     if (href === '/') return pathname === '/'
@@ -40,6 +57,20 @@ function Sidebar() {
             {label}
           </Link>
         ))}
+        <Link
+          href="/pending"
+          className={cn(
+            'flex items-center justify-between px-4 py-2.5 text-sm rounded-md mx-2 my-0.5 hover:bg-slate-700 transition-colors text-slate-300',
+            isActive('/pending') && 'bg-slate-700 text-white font-medium'
+          )}
+        >
+          <span>Pending</span>
+          {pendingCount > 0 && (
+            <span className="ml-auto bg-red-500 text-white text-xs font-medium px-1.5 py-0.5 rounded-full">
+              {pendingCount}
+            </span>
+          )}
+        </Link>
       </nav>
     </aside>
   )
