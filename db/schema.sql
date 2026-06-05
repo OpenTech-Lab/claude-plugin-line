@@ -37,8 +37,14 @@ CREATE TABLE IF NOT EXISTS tenant_guardrails (
   blocked_topics       TEXT[],
   blocked_words        TEXT[],
   pii_redaction        BOOLEAN DEFAULT false,
-  custom_instructions  TEXT
+  custom_instructions  TEXT,
+  allowed_paths        TEXT[],
+  blocked_paths        TEXT[]
 );
+
+-- Idempotent migration: add path columns if the table already existed without them
+ALTER TABLE tenant_guardrails ADD COLUMN IF NOT EXISTS allowed_paths TEXT[];
+ALTER TABLE tenant_guardrails ADD COLUMN IF NOT EXISTS blocked_paths TEXT[];
 
 CREATE TABLE IF NOT EXISTS tenant_metadata (
   tenant_id  TEXT REFERENCES tenants(id) ON DELETE CASCADE,

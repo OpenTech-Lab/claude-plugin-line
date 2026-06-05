@@ -30,18 +30,22 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
       blocked_words,
       pii_redaction,
       custom_instructions,
+      allowed_paths,
+      blocked_paths,
     } = body
 
     const result = await query(
       `INSERT INTO tenant_guardrails
-         (tenant_id, allowed_topics, blocked_topics, blocked_words, pii_redaction, custom_instructions)
-       VALUES ($1, $2, $3, $4, $5, $6)
+         (tenant_id, allowed_topics, blocked_topics, blocked_words, pii_redaction, custom_instructions, allowed_paths, blocked_paths)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
        ON CONFLICT (tenant_id) DO UPDATE SET
-         allowed_topics    = EXCLUDED.allowed_topics,
-         blocked_topics    = EXCLUDED.blocked_topics,
-         blocked_words     = EXCLUDED.blocked_words,
-         pii_redaction     = EXCLUDED.pii_redaction,
-         custom_instructions = EXCLUDED.custom_instructions
+         allowed_topics      = EXCLUDED.allowed_topics,
+         blocked_topics      = EXCLUDED.blocked_topics,
+         blocked_words       = EXCLUDED.blocked_words,
+         pii_redaction       = EXCLUDED.pii_redaction,
+         custom_instructions = EXCLUDED.custom_instructions,
+         allowed_paths       = EXCLUDED.allowed_paths,
+         blocked_paths       = EXCLUDED.blocked_paths
        RETURNING *`,
       [
         id,
@@ -50,6 +54,8 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
         blocked_words ?? null,
         pii_redaction ?? null,
         custom_instructions ?? null,
+        allowed_paths ?? null,
+        blocked_paths ?? null,
       ]
     )
 

@@ -62,6 +62,8 @@ type Guardrails = {
   blocked_words?: string[] | null
   pii_redaction?: boolean
   custom_instructions?: string | null
+  allowed_paths?: string[] | null
+  blocked_paths?: string[] | null
 }
 
 type Document = {
@@ -537,6 +539,8 @@ function GuardrailsTab({ tenant }: { tenant: Tenant }) {
   const [blockedWords, setBlockedWords] = useState(arrToText(g.blocked_words))
   const [piiRedaction, setPiiRedaction] = useState(g.pii_redaction ?? false)
   const [customInstructions, setCustomInstructions] = useState(g.custom_instructions ?? '')
+  const [allowedPaths, setAllowedPaths] = useState(arrToText(g.allowed_paths))
+  const [blockedPaths, setBlockedPaths] = useState(arrToText(g.blocked_paths))
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; msg: string } | null>(null)
 
@@ -552,6 +556,8 @@ function GuardrailsTab({ tenant }: { tenant: Tenant }) {
           blocked_words: textToArr(blockedWords).length ? textToArr(blockedWords) : null,
           pii_redaction: piiRedaction,
           custom_instructions: customInstructions.trim() || null,
+          allowed_paths: textToArr(allowedPaths).length ? textToArr(allowedPaths) : null,
+          blocked_paths: textToArr(blockedPaths).length ? textToArr(blockedPaths) : null,
         }),
       })
       const data = await res.json()
@@ -565,7 +571,7 @@ function GuardrailsTab({ tenant }: { tenant: Tenant }) {
   }
 
   return (
-    <div className="space-y-4">
+    <div className="space-y-5">
       <div className="space-y-1.5">
         <Label htmlFor="guard-topics">Blocked Topics</Label>
         <Textarea
@@ -603,6 +609,41 @@ function GuardrailsTab({ tenant }: { tenant: Tenant }) {
           placeholder="Additional guardrail instructions for this tenant…"
         />
       </div>
+
+      <Separator />
+
+      <div className="space-y-1">
+        <p className="text-sm font-semibold">Path Access Control</p>
+        <p className="text-xs text-muted-foreground">
+          Restrict which filesystem paths the agent may access when responding to this tenant.
+          One absolute path per line. If <strong>Allowed paths</strong> is set, the agent will only
+          access paths within that list. <strong>Blocked paths</strong> are always denied regardless of allowed list.
+          Enforcement is instruction-based — the agent reads and follows these rules from context.
+        </p>
+      </div>
+      <div className="grid grid-cols-2 gap-4">
+        <div className="space-y-1.5">
+          <Label htmlFor="guard-allowed-paths">Allowed Paths</Label>
+          <Textarea
+            id="guard-allowed-paths"
+            className="font-mono text-xs min-h-[120px]"
+            placeholder={'/home/user/projects/myapp\n/home/user/docs'}
+            value={allowedPaths}
+            onChange={(e) => setAllowedPaths(e.target.value)}
+          />
+        </div>
+        <div className="space-y-1.5">
+          <Label htmlFor="guard-blocked-paths">Blocked Paths</Label>
+          <Textarea
+            id="guard-blocked-paths"
+            className="font-mono text-xs min-h-[120px]"
+            placeholder={'/etc\n/home/user/.ssh\n/var/secrets'}
+            value={blockedPaths}
+            onChange={(e) => setBlockedPaths(e.target.value)}
+          />
+        </div>
+      </div>
+
       <Button onClick={handleSave} disabled={saving}>
         {saving ? 'Saving…' : 'Save Guardrails'}
       </Button>

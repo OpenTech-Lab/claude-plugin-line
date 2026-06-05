@@ -59,11 +59,13 @@ export async function enrichContext(
     blocked_topics: string[] | null;
     pii_redaction: boolean;
     custom_instructions: string | null;
+    allowed_paths: string[] | null;
+    blocked_paths: string[] | null;
   } | null = null;
 
   try {
     const grResult = await query(
-      'SELECT blocked_topics, pii_redaction, custom_instructions FROM tenant_guardrails WHERE tenant_id = $1',
+      'SELECT blocked_topics, pii_redaction, custom_instructions, allowed_paths, blocked_paths FROM tenant_guardrails WHERE tenant_id = $1',
       [tenantId],
     );
     guardrails = grResult.rows[0] ?? null;
@@ -109,6 +111,16 @@ export async function enrichContext(
     hasGuardrailContent = true;
     if (guardrails.custom_instructions) {
       guardrailLines.push(`Additional instructions: ${guardrails.custom_instructions}`);
+    }
+    if (guardrails.allowed_paths && guardrails.allowed_paths.length > 0) {
+      guardrailLines.push(`Allowed file paths: ${guardrails.allowed_paths.join(', ')}`);
+      guardrailLines.push('IMPORTANT: Only read, write, or execute files within the allowed paths listed above. Refuse any request that would access a path outside this list.');
+      hasGuardrailContent = true;
+    }
+    if (guardrails.blocked_paths && guardrails.blocked_paths.length > 0) {
+      guardrailLines.push(`Blocked file paths: ${guardrails.blocked_paths.join(', ')}`);
+      guardrailLines.push('IMPORTANT: Never read, write, execute, or reference files in the blocked paths listed above, even if explicitly asked.');
+      hasGuardrailContent = true;
     }
   } else {
     guardrailLines.push('PII redaction: no');
