@@ -1,0 +1,15 @@
+{
+  "/_global-error/page": "app/_global-error/page.js",
+  "/_not-found/page": "app/_not-found/page.js",
+  "/activity/page": "app/activity/page.js",
+  "/api/activity/route": "app/api/activity/route.js",
+  "/api/tenants/[id]/documents/[docId]/route": "app/api/tenants/[id]/documents/[docId]/route.js",
+  "/api/tenants/[id]/documents/route": "app/api/tenants/[id]/documents/route.js",
+  "/api/tenants/[id]/guardrails/route": "app/api/tenants/[id]/guardrails/route.js",
+  "/api/tenants/[id]/metadata/route": "app/api/tenants/[id]/metadata/route.js",
+  "/api/tenants/[id]/route": "app/api/tenants/[id]/route.js",
+  "/api/tenants/route": "app/api/tenants/route.js",
+  "/page": "app/page.js",
+  "/tenants/[id]/page": "app/tenants/[id]/page.js",
+  "/tenants/page": "app/tenants/page.js"
+}

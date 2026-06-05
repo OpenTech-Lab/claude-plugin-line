@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
 
 interface RouteParams {
-  params: { id: string }
+  params: Promise<{ id: string }>
 }
 
 export async function GET(_req: NextRequest, { params }: RouteParams) {
-  const { id } = params
+  const { id } = await params
   try {
     const tenantResult = await query('SELECT * FROM tenants WHERE id = $1', [id])
     if (tenantResult.rows.length === 0) {
@@ -41,7 +41,7 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
 }
 
 export async function PUT(req: NextRequest, { params }: RouteParams) {
-  const { id } = params
+  const { id } = await params
   try {
     const body = await req.json()
     const { display_name, system_prompt, is_active } = body
@@ -86,7 +86,7 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
 }
 
 export async function DELETE(_req: NextRequest, { params }: RouteParams) {
-  const { id } = params
+  const { id } = await params
   try {
     const result = await query('DELETE FROM tenants WHERE id = $1 RETURNING id', [id])
     if (result.rows.length === 0) {

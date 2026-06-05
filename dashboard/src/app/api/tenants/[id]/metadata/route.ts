@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
 
 interface RouteParams {
-  params: { id: string }
+  params: Promise<{ id: string }>
 }
 
 export async function GET(_req: NextRequest, { params }: RouteParams) {
-  const { id } = params
+  const { id } = await params
   try {
     const result = await query(
       'SELECT key, value FROM tenant_metadata WHERE tenant_id = $1',
@@ -25,7 +25,7 @@ export async function GET(_req: NextRequest, { params }: RouteParams) {
 }
 
 export async function PUT(req: NextRequest, { params }: RouteParams) {
-  const { id } = params
+  const { id } = await params
   try {
     const body: Record<string, string> = await req.json()
     const entries = Object.entries(body)

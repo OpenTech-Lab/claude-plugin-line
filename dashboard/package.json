@@ -3,21 +3,21 @@
   "version": "0.0.1",
   "private": true,
   "scripts": {
-    "dev": "next dev -p 3000",
+    "dev": "next dev -p 3001",
     "build": "next build",
-    "start": "next start -p 3000"
+    "start": "next start -p 3001"
   },
   "dependencies": {
-    "next": "14.2.29",
-    "react": "^18",
-    "react-dom": "^18",
+    "next": "^16.2.7",
+    "react": "^19",
+    "react-dom": "^19",
     "pg": "^8.11.3"
   },
   "devDependencies": {
     "@types/node": "^20",
     "@types/pg": "^8",
-    "@types/react": "^18",
-    "@types/react-dom": "^18",
+    "@types/react": "^19",
+    "@types/react-dom": "^19",
     "typescript": "^5"
   }
 }

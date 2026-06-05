@@ -2,11 +2,11 @@ import { NextRequest, NextResponse } from 'next/server'
 import { query } from '@/lib/db'
 
 interface RouteParams {
-  params: { id: string; docId: string }
+  params: Promise<{ id: string; docId: string }>
 }
 
 export async function DELETE(_req: NextRequest, { params }: RouteParams) {
-  const { id, docId } = params
+  const { id, docId } = await params
   try {
     const result = await query(
       'DELETE FROM kb_documents WHERE id = $1 AND tenant_id = $2 RETURNING id',
