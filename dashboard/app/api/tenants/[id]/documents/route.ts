@@ -1,6 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server'
 import { promises as dns } from 'dns'
-import { isIP } from 'net'
+import * as ipaddr from 'ipaddr.js'
 import { query } from '@/lib/db'
 // Direct import avoids pdf-parse's test-file side effect on module load
 import pdfParse from 'pdf-parse/lib/pdf-parse.js'
@@ -26,22 +26,20 @@ function extractTextFromHtml(html: string): string {
 
 // SSRF protection -------------------------------------------------------
 
-const PRIVATE_IPV4 = [
-  /^127\./,                                    // 127.0.0.0/8  loopback
-  /^10\./,                                     // 10.0.0.0/8   private
-  /^172\.(1[6-9]|2\d|3[01])\./,               // 172.16.0.0/12 private
-  /^192\.168\./,                               // 192.168.0.0/16 private
-  /^169\.254\./,                               // 169.254.0.0/16 link-local (cloud metadata)
-  /^100\.(6[4-9]|[7-9]\d|1[01]\d|12[0-7])\./, // 100.64.0.0/10 shared
-  /^0\./,                                      // 0.0.0.0/8
-]
-const PRIVATE_IPV6 = [/^::1$/, /^::\d*$/, /^fc/i, /^fd/i, /^fe80/i]
+const ALLOWED_RANGES = new Set(['unicast'])
 
 function isPrivateIp(addr: string): boolean {
-  const v = isIP(addr)
-  if (v === 4) return PRIVATE_IPV4.some(r => r.test(addr))
-  if (v === 6) return PRIVATE_IPV6.some(r => r.test(addr.toLowerCase()))
-  return false
+  try {
+    let ip = ipaddr.parse(addr)
+    // Unwrap IPv4-mapped IPv6 (::ffff:x.x.x.x) so it hits the IPv4 range checks
+    if (ip.kind() === 'ipv6') {
+      const v6 = ip as ipaddr.IPv6
+      if (v6.isIPv4MappedAddress()) ip = v6.toIPv4Address()
+    }
+    return !ALLOWED_RANGES.has(ip.range())
+  } catch {
+    return true // unparseable → block
+  }
 }
 
 async function resolveAndBlock(hostname: string): Promise<void> {
