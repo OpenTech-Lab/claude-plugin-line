@@ -1,5 +1,15 @@
 import { query } from '@/lib/db'
 import Link from 'next/link'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
+import { Badge } from '@/components/ui/badge'
 
 type ActivityEntry = {
   id: string
@@ -12,9 +22,9 @@ type ActivityEntry = {
 
 async function getStats() {
   const [totalResult, activeResult, docsResult, activityResult] = await Promise.all([
-    query('SELECT COUNT(*) AS count FROM tenants'),
-    query('SELECT COUNT(*) AS count FROM tenants WHERE is_active = true'),
-    query('SELECT COUNT(*) AS count FROM kb_documents'),
+    query('SELECT COUNT(*)::int AS count FROM tenants'),
+    query('SELECT COUNT(*)::int AS count FROM tenants WHERE is_active = true'),
+    query('SELECT COUNT(*)::int AS count FROM kb_documents'),
     query(
       `SELECT id, tenant_id, user_id, message_preview, chunks_retrieved, created_at
        FROM activity_log
@@ -49,94 +59,103 @@ export default async function OverviewPage() {
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     return (
-      <div>
-        <div className="page-header">
-          <h1>Overview</h1>
+      <div className="p-6">
+        <h1 className="text-2xl font-bold mb-4">Overview</h1>
+        <div className="rounded border border-red-200 bg-red-50 text-red-800 px-4 py-3 text-sm">
+          Failed to load stats: {msg}
         </div>
-        <div className="notice notice-error">Failed to load stats: {msg}</div>
       </div>
     )
   }
 
   const { totalTenants, activeTenants, totalDocuments, recentActivity } = stats
 
+  const statCards = [
+    { label: 'Total Tenants', value: totalTenants },
+    { label: 'Active Tenants', value: activeTenants },
+    { label: 'Inactive', value: totalTenants - activeTenants },
+    { label: 'Documents', value: totalDocuments },
+  ]
+
   return (
-    <div>
-      <div className="page-header">
-        <h1>Overview</h1>
-        <p>System-wide stats for the LINE bot multi-tenant system.</p>
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-1">Overview</h1>
+      <p className="text-sm text-muted-foreground mb-6">
+        System-wide stats for the LINE bot multi-tenant system.
+      </p>
+
+      <div className="grid grid-cols-4 gap-4 mb-6">
+        {statCards.map(({ label, value }) => (
+          <Card key={label}>
+            <CardHeader className="pb-1">
+              <CardTitle className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                {label}
+              </CardTitle>
+            </CardHeader>
+            <CardContent>
+              <div className="text-3xl font-bold">{value}</div>
+            </CardContent>
+          </Card>
+        ))}
       </div>
 
-      <div className="stat-grid">
-        <div className="stat-card">
-          <div className="stat-label">Total Tenants</div>
-          <div className="stat-value">{totalTenants}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Active Tenants</div>
-          <div className="stat-value">{activeTenants}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Inactive</div>
-          <div className="stat-value">{totalTenants - activeTenants}</div>
-        </div>
-        <div className="stat-card">
-          <div className="stat-label">Documents</div>
-          <div className="stat-value">{totalDocuments}</div>
-        </div>
-      </div>
-
-      <div className="card">
-        <h2>Recent Activity</h2>
-        {recentActivity.length === 0 ? (
-          <p className="text-muted">No activity recorded yet.</p>
-        ) : (
-          <div className="table-wrap">
-            <table>
-              <thead>
-                <tr>
-                  <th>Timestamp</th>
-                  <th>Tenant</th>
-                  <th>User ID</th>
-                  <th>Message Preview</th>
-                  <th>Chunks</th>
-                </tr>
-              </thead>
-              <tbody>
+      <Card>
+        <CardHeader>
+          <CardTitle>Recent Activity</CardTitle>
+        </CardHeader>
+        <CardContent className="p-0">
+          {recentActivity.length === 0 ? (
+            <p className="text-muted-foreground text-sm px-6 pb-6">No activity recorded yet.</p>
+          ) : (
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Timestamp</TableHead>
+                  <TableHead>Tenant</TableHead>
+                  <TableHead>User ID</TableHead>
+                  <TableHead>Message Preview</TableHead>
+                  <TableHead>Chunks</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
                 {recentActivity.map((entry) => (
-                  <tr key={entry.id}>
-                    <td className="text-mono">{formatDate(entry.created_at)}</td>
-                    <td>
-                      <Link href={`/tenants/${encodeURIComponent(entry.tenant_id)}`}>
-                        <span
-                          className="text-mono"
-                          title={entry.tenant_id}
-                        >
+                  <TableRow key={entry.id}>
+                    <TableCell className="font-mono text-xs whitespace-nowrap">
+                      {formatDate(entry.created_at)}
+                    </TableCell>
+                    <TableCell>
+                      <Link
+                        href={`/tenants/${encodeURIComponent(entry.tenant_id)}`}
+                        className="text-blue-600 hover:underline"
+                      >
+                        <span className="font-mono text-xs" title={entry.tenant_id}>
                           {entry.tenant_id.length > 20
                             ? entry.tenant_id.slice(0, 20) + '…'
                             : entry.tenant_id}
                         </span>
                       </Link>
-                    </td>
-                    <td className="text-mono" style={{ color: '#555' }}>
+                    </TableCell>
+                    <TableCell className="font-mono text-xs text-muted-foreground">
                       {entry.user_id}
-                    </td>
-                    <td style={{ maxWidth: 300, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                      {entry.message_preview ?? <span className="text-muted">—</span>}
-                    </td>
-                    <td style={{ textAlign: 'center' }}>{entry.chunks_retrieved}</td>
-                  </tr>
+                    </TableCell>
+                    <TableCell className="max-w-xs truncate">
+                      {entry.message_preview ?? (
+                        <span className="text-muted-foreground">—</span>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-center">{entry.chunks_retrieved}</TableCell>
+                  </TableRow>
                 ))}
-              </tbody>
-            </table>
+              </TableBody>
+            </Table>
+          )}
+          <div className="px-6 pb-4 pt-2">
+            <Link href="/activity" className="text-sm text-blue-600 hover:underline">
+              View all activity →
+            </Link>
           </div>
-        )}
-        <div style={{ marginTop: 12 }}>
-          <Link href="/activity" className="btn btn-secondary btn-sm">
-            View all activity →
-          </Link>
-        </div>
-      </div>
+        </CardContent>
+      </Card>
     </div>
   )
 }

@@ -2,6 +2,15 @@
 
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
+import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from '@/components/ui/table'
 
 type ActivityEntry = {
   id: string
@@ -45,71 +54,73 @@ export default function ActivityPage() {
   }, [])
 
   return (
-    <div>
-      <div className="page-header">
-        <h1>Activity Log</h1>
-        <p>Most recent 50 interactions across all tenants.</p>
-      </div>
+    <div className="p-6">
+      <h1 className="text-2xl font-bold mb-1">Activity Log</h1>
+      <p className="text-sm text-muted-foreground mb-6">
+        Most recent 50 interactions across all tenants.
+      </p>
 
-      {loading && <p className="text-muted">Loading…</p>}
-      {error && <div className="notice notice-error">Error: {error}</div>}
+      {loading && <p className="text-muted-foreground text-sm">Loading…</p>}
+      {error && (
+        <div className="rounded border border-red-200 bg-red-50 text-red-800 px-4 py-3 text-sm">
+          Error: {error}
+        </div>
+      )}
 
       {!loading && !error && (
-        <div className="card">
-          {entries.length === 0 ? (
-            <p className="text-muted">No activity recorded yet.</p>
-          ) : (
-            <div className="table-wrap">
-              <table>
-                <thead>
-                  <tr>
-                    <th>Timestamp</th>
-                    <th>Tenant</th>
-                    <th>User ID</th>
-                    <th>Message Preview</th>
-                    <th>Chunks</th>
-                  </tr>
-                </thead>
-                <tbody>
+        <Card>
+          <CardContent className="p-0">
+            {entries.length === 0 ? (
+              <p className="text-muted-foreground text-sm p-6">No activity recorded yet.</p>
+            ) : (
+              <Table>
+                <TableHeader>
+                  <TableRow>
+                    <TableHead>Timestamp</TableHead>
+                    <TableHead>Tenant ID</TableHead>
+                    <TableHead>User ID</TableHead>
+                    <TableHead>Message Preview</TableHead>
+                    <TableHead>Chunks</TableHead>
+                  </TableRow>
+                </TableHeader>
+                <TableBody>
                   {entries.map((entry) => (
-                    <tr key={entry.id}>
-                      <td className="text-mono" style={{ whiteSpace: 'nowrap' }}>
+                    <TableRow key={entry.id}>
+                      <TableCell className="font-mono text-xs whitespace-nowrap">
                         {formatDate(entry.created_at)}
-                      </td>
-                      <td>
+                      </TableCell>
+                      <TableCell>
                         <Link
                           href={`/tenants/${encodeURIComponent(entry.tenant_id)}`}
+                          className="text-blue-600 hover:underline"
                           title={entry.tenant_id}
                         >
-                          <span className="text-mono">
+                          <span className="font-mono text-xs">
                             {entry.tenant_id.length > 20
                               ? entry.tenant_id.slice(0, 20) + '…'
                               : entry.tenant_id}
                           </span>
                         </Link>
-                      </td>
-                      <td className="text-mono" style={{ color: '#555' }}>
+                      </TableCell>
+                      <TableCell className="font-mono text-xs text-muted-foreground">
                         {entry.user_id}
-                      </td>
-                      <td
-                        style={{
-                          maxWidth: 380,
-                          overflow: 'hidden',
-                          textOverflow: 'ellipsis',
-                          whiteSpace: 'nowrap',
-                        }}
+                      </TableCell>
+                      <TableCell
+                        className="max-w-xs truncate text-sm"
                         title={entry.message_preview ?? undefined}
                       >
-                        {entry.message_preview ?? <span className="text-muted">—</span>}
-                      </td>
-                      <td style={{ textAlign: 'center' }}>{entry.chunks_retrieved}</td>
-                    </tr>
+                        {entry.message_preview ?? (
+                          <span className="text-muted-foreground">—</span>
+                        )}
+                      </TableCell>
+                      <TableCell className="text-center">{entry.chunks_retrieved}</TableCell>
+                    </TableRow>
                   ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-        </div>
+                </TableBody>
+              </Table>
+            )}
+          </CardContent>
+        </Card>
       )}
     </div>
   )
