@@ -16,6 +16,7 @@ import {
 } from 'fs'
 import { homedir } from 'os'
 import { join } from 'path'
+import { enrichContext, autoRegisterTenant } from './lib/tenant.ts'
 
 // ── Constants ────────────────────────────────────────────────────────────────
 
@@ -554,6 +555,10 @@ async function handleInbound(
     if (attachment.size != null) meta.attachment_size = String(attachment.size)
   }
 
+  void autoRegisterTenant(userId, 'user').catch(() => {})
+  const injectedContext = await enrichContext(userId, text).catch(() => '')
+  if (injectedContext) meta.injected_context = injectedContext
+
   mcp.notification({ method: 'notifications/claude/channel', params: { content: text, meta } })
     .catch(e => process.stderr.write(`line channel: notification delivery failed: ${e}\n`))
 }
@@ -623,6 +628,10 @@ async function handleGroupInbound(
     if (attachment.name) meta.attachment_name = attachment.name.replace(/[<>\[\]\r\n;]/g, '_')
     if (attachment.size != null) meta.attachment_size = String(attachment.size)
   }
+
+  void autoRegisterTenant(groupId, 'group').catch(() => {})
+  const injectedContext = await enrichContext(groupId, cleanText).catch(() => '')
+  if (injectedContext) meta.injected_context = injectedContext
 
   mcp.notification({ method: 'notifications/claude/channel', params: { content: cleanText, meta } })
     .catch(e => process.stderr.write(`line channel: group notification failed: ${e}\n`))

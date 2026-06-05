@@ -1,4 +1,21 @@
 services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: linebot
+      POSTGRES_PASSWORD: linebot
+      POSTGRES_DB: linebot
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U linebot"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
   bridge:
     build: .
     env_file: .env
@@ -18,3 +35,6 @@ services:
     depends_on:
       - bridge
     restart: unless-stopped
+
+volumes:
+  pgdata:
