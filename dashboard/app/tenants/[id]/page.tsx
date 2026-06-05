@@ -1,6 +1,6 @@
 'use client'
 
-import { useEffect, useState, useCallback } from 'react'
+import { useEffect, useState, useCallback, useRef } from 'react'
 import { useParams } from 'next/navigation'
 import Link from 'next/link'
 import { Card, CardContent } from '@/components/ui/card'
@@ -27,6 +27,23 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select'
+import {
+  Dialog,
+  DialogContent,
+  DialogHeader,
+  DialogTitle,
+  DialogTrigger,
+} from '@/components/ui/dialog'
+import {
+  UploadCloud,
+  Globe,
+  FileText,
+  File,
+  FileType2,
+  Plus,
+  Trash2,
+} from 'lucide-react'
+import { cn } from '@/lib/utils'
 
 // ---------- Types ----------
 type Tenant = {
@@ -176,20 +193,253 @@ function PersonaTab({ tenant, onUpdate }: { tenant: Tenant; onUpdate: (t: Tenant
   )
 }
 
+// ---------- Source type helpers ----------
+type SourceMode = 'upload' | 'website' | 'text'
+
+const SOURCE_TYPES: { id: SourceMode; Icon: React.FC<{ className?: string }>; label: string; desc: string }[] = [
+  { id: 'upload', Icon: UploadCloud, label: 'Upload file',  desc: 'PDF, TXT, Markdown' },
+  { id: 'website', Icon: Globe,       label: 'Website',      desc: 'Import from a URL'  },
+  { id: 'text',    Icon: FileText,    label: 'Paste text',   desc: 'Copy & paste content' },
+]
+
+function sourceIcon(fileType: string | null) {
+  if (fileType === 'pdf')     return <FileType2 className="size-4 text-red-500" />
+  if (fileType === 'website') return <Globe className="size-4 text-blue-500" />
+  if (fileType === 'markdown') return <File className="size-4 text-purple-500" />
+  return <FileText className="size-4 text-slate-400" />
+}
+
+// ---------- Add Source Dialog ----------
+function AddSourceDialog({
+  tenantId,
+  onAdded,
+}: {
+  tenantId: string
+  onAdded: (doc: Document) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [mode, setMode] = useState<SourceMode | null>(null)
+
+  // upload state
+  const fileInputRef = useRef<HTMLInputElement>(null)
+  const [uploadFile, setUploadFile] = useState<File | null>(null)
+  const [uploadTitle, setUploadTitle] = useState('')
+  const [isDragging, setIsDragging] = useState(false)
+
+  // website state
+  const [url, setUrl] = useState('')
+  const [websiteTitle, setWebsiteTitle] = useState('')
+
+  // text state
+  const [textTitle, setTextTitle] = useState('')
+  const [textContent, setTextContent] = useState('')
+
+  const [submitting, setSubmitting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  function reset() {
+    setMode(null)
+    setUploadFile(null)
+    setUploadTitle('')
+    setUrl('')
+    setWebsiteTitle('')
+    setTextTitle('')
+    setTextContent('')
+    setError(null)
+    setSubmitting(false)
+  }
+
+  function handleFileSelect(file: File) {
+    setUploadFile(file)
+    setUploadTitle(file.name.replace(/\.[^.]+$/, ''))
+  }
+
+  async function handleSubmit() {
+    setError(null)
+    setSubmitting(true)
+    try {
+      let res: Response
+
+      if (mode === 'upload') {
+        if (!uploadFile) { setError('Please select a file.'); return }
+        const form = new FormData()
+        form.append('file', uploadFile)
+        form.append('title', uploadTitle.trim() || uploadFile.name.replace(/\.[^.]+$/, ''))
+        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
+          method: 'POST',
+          body: form,
+        })
+      } else if (mode === 'website') {
+        if (!url.trim()) { setError('Please enter a URL.'); return }
+        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source_type: 'website', url: url.trim(), title: websiteTitle.trim() || undefined }),
+        })
+      } else {
+        if (!textTitle.trim() || !textContent.trim()) { setError('Title and content are required.'); return }
+        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ source_type: 'text', title: textTitle.trim(), content: textContent.trim(), file_type: 'text' }),
+        })
+      }
+
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+      onAdded(data)
+      setOpen(false)
+      reset()
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSubmitting(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={(v) => { setOpen(v); if (!v) reset() }}>
+      <DialogTrigger asChild>
+        <Button size="sm" className="gap-1.5">
+          <Plus className="size-4" /> Add source
+        </Button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-lg">
+        <DialogHeader>
+          <DialogTitle>Add source</DialogTitle>
+        </DialogHeader>
+
+        {/* Source type picker */}
+        <div className="grid grid-cols-3 gap-2 mt-1">
+          {SOURCE_TYPES.map(({ id, Icon, label, desc }) => (
+            <button
+              key={id}
+              type="button"
+              onClick={() => { setMode(id); setError(null) }}
+              className={cn(
+                'flex flex-col items-center gap-1.5 rounded-lg border p-4 text-center transition-colors hover:bg-accent',
+                mode === id ? 'border-primary bg-accent' : 'border-border'
+              )}
+            >
+              <Icon className="size-6 text-muted-foreground" />
+              <span className="text-sm font-medium">{label}</span>
+              <span className="text-xs text-muted-foreground leading-tight">{desc}</span>
+            </button>
+          ))}
+        </div>
+
+        {/* Contextual form */}
+        {mode === 'upload' && (
+          <div className="space-y-3 mt-2">
+            <div
+              className={cn(
+                'flex flex-col items-center justify-center gap-2 rounded-lg border-2 border-dashed p-8 cursor-pointer transition-colors',
+                isDragging ? 'border-primary bg-accent' : 'border-border hover:border-muted-foreground'
+              )}
+              onClick={() => fileInputRef.current?.click()}
+              onDragOver={(e) => { e.preventDefault(); setIsDragging(true) }}
+              onDragLeave={() => setIsDragging(false)}
+              onDrop={(e) => {
+                e.preventDefault(); setIsDragging(false)
+                const f = e.dataTransfer.files[0]
+                if (f) handleFileSelect(f)
+              }}
+            >
+              <UploadCloud className="size-8 text-muted-foreground" />
+              <p className="text-sm text-muted-foreground text-center">
+                {uploadFile
+                  ? <><span className="font-medium text-foreground">{uploadFile.name}</span><br />{(uploadFile.size / 1024).toFixed(0)} KB</>
+                  : <><span className="font-medium">Click to browse</span> or drag & drop<br />PDF, TXT, Markdown</>
+                }
+              </p>
+              <input
+                ref={fileInputRef}
+                type="file"
+                accept=".pdf,.txt,.md,.markdown,text/plain,text/markdown,application/pdf"
+                className="hidden"
+                onChange={(e) => { const f = e.target.files?.[0]; if (f) handleFileSelect(f) }}
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Title (optional)</Label>
+              <Input
+                value={uploadTitle}
+                onChange={(e) => setUploadTitle(e.target.value)}
+                placeholder="Auto-filled from filename"
+              />
+            </div>
+          </div>
+        )}
+
+        {mode === 'website' && (
+          <div className="space-y-3 mt-2">
+            <div className="space-y-1.5">
+              <Label>URL *</Label>
+              <Input
+                type="url"
+                value={url}
+                onChange={(e) => setUrl(e.target.value)}
+                placeholder="https://example.com/article"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Title (optional)</Label>
+              <Input
+                value={websiteTitle}
+                onChange={(e) => setWebsiteTitle(e.target.value)}
+                placeholder="Auto-filled from page title"
+              />
+            </div>
+          </div>
+        )}
+
+        {mode === 'text' && (
+          <div className="space-y-3 mt-2">
+            <div className="space-y-1.5">
+              <Label>Title *</Label>
+              <Input
+                value={textTitle}
+                onChange={(e) => setTextTitle(e.target.value)}
+                placeholder="Source title"
+                autoFocus
+              />
+            </div>
+            <div className="space-y-1.5">
+              <Label>Content *</Label>
+              <Textarea
+                className="min-h-[140px] font-mono text-sm"
+                value={textContent}
+                onChange={(e) => setTextContent(e.target.value)}
+                placeholder="Paste your content here…"
+              />
+            </div>
+          </div>
+        )}
+
+        {error && <Notice type="error">{error}</Notice>}
+
+        {mode && (
+          <div className="flex justify-end gap-2 mt-2">
+            <Button variant="outline" onClick={() => { setOpen(false); reset() }}>Cancel</Button>
+            <Button onClick={handleSubmit} disabled={submitting}>
+              {submitting
+                ? (mode === 'website' ? 'Importing…' : 'Adding…')
+                : (mode === 'website' ? 'Import' : 'Add source')
+              }
+            </Button>
+          </div>
+        )}
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ---------- Knowledge Base Tab ----------
 function KnowledgeTab({ tenantId }: { tenantId: string }) {
   const [docs, setDocs] = useState<Document[]>([])
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
-
-  const [title, setTitle] = useState('')
-  const [content, setContent] = useState('')
-  const [fileType, setFileType] = useState('text')
-  const [pdfFile, setPdfFile] = useState<File | null>(null)
-  const [adding, setAdding] = useState(false)
-  const [addNotice, setAddNotice] = useState<{ type: 'success' | 'error'; msg: string } | null>(
-    null
-  )
 
   const loadDocs = useCallback(async () => {
     setLoading(true)
@@ -205,12 +455,10 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
     }
   }, [tenantId])
 
-  useEffect(() => {
-    loadDocs()
-  }, [loadDocs])
+  useEffect(() => { loadDocs() }, [loadDocs])
 
   async function deleteDoc(doc: Document) {
-    if (!confirm(`Delete document "${doc.title ?? doc.id}"?`)) return
+    if (!confirm(`Delete "${doc.title ?? doc.file_name ?? doc.id}"?`)) return
     try {
       const res = await fetch(
         `/api/tenants/${encodeURIComponent(tenantId)}/documents/${doc.id}`,
@@ -223,174 +471,61 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
     }
   }
 
-  async function handleAddDoc(e: React.FormEvent) {
-    e.preventDefault()
-    setAddNotice(null)
-
-    if (fileType === 'pdf') {
-      if (!title.trim() || !pdfFile) {
-        setAddNotice({ type: 'error', msg: 'Title and a PDF file are required.' })
-        return
-      }
-    } else if (!title.trim() || !content.trim()) {
-      setAddNotice({ type: 'error', msg: 'Title and content are required.' })
-      return
-    }
-
-    setAdding(true)
-    try {
-      let res: Response
-      if (fileType === 'pdf' && pdfFile) {
-        const form = new FormData()
-        form.append('title', title.trim())
-        form.append('file_type', 'pdf')
-        form.append('file', pdfFile)
-        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
-          method: 'POST',
-          body: form,
-        })
-      } else {
-        res = await fetch(`/api/tenants/${encodeURIComponent(tenantId)}/documents`, {
-          method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ title: title.trim(), content: content.trim(), file_type: fileType }),
-        })
-      }
-      const data = await res.json()
-      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
-      setDocs((prev) => [data, ...prev])
-      setTitle('')
-      setContent('')
-      setPdfFile(null)
-      setFileType('text')
-      setAddNotice({ type: 'success', msg: 'Document added.' })
-    } catch (err) {
-      setAddNotice({ type: 'error', msg: err instanceof Error ? err.message : String(err) })
-    } finally {
-      setAdding(false)
-    }
-  }
-
   return (
-    <div className="space-y-6">
-      {loading && <p className="text-muted-foreground text-sm">Loading documents…</p>}
-      {error && <Notice type="error">Error: {error}</Notice>}
-      {!loading && !error && (
-        <>
-          {docs.length === 0 ? (
-            <p className="text-muted-foreground text-sm">No documents yet.</p>
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Title</TableHead>
-                  <TableHead>File Type</TableHead>
-                  <TableHead>Chunks</TableHead>
-                  <TableHead>Added</TableHead>
-                  <TableHead>Actions</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {docs.map((doc) => (
-                  <TableRow key={doc.id}>
-                    <TableCell>
-                      {doc.title ?? (
-                        <span className="text-muted-foreground">{doc.file_name ?? '—'}</span>
-                      )}
-                    </TableCell>
-                    <TableCell>
-                      {doc.file_type ? (
-                        <Badge variant="outline">{doc.file_type}</Badge>
-                      ) : (
-                        <span className="text-muted-foreground">—</span>
-                      )}
-                    </TableCell>
-                    <TableCell className="text-center">{doc.chunk_count}</TableCell>
-                    <TableCell className="text-muted-foreground text-sm">
-                      {formatDate(doc.created_at)}
-                    </TableCell>
-                    <TableCell>
-                      <Button
-                        variant="destructive"
-                        size="sm"
-                        onClick={() => deleteDoc(doc)}
-                      >
-                        Delete
-                      </Button>
-                    </TableCell>
-                  </TableRow>
-                ))}
-              </TableBody>
-            </Table>
-          )}
-          <p className="text-xs text-muted-foreground">
-            After saving a document, embeddings are generated the next time a message arrives from
-            this tenant.
+    <div className="space-y-4">
+      <div className="flex items-center justify-between">
+        <div>
+          <p className="text-sm font-semibold">
+            Sources {!loading && docs.length > 0 && <span className="text-muted-foreground font-normal">({docs.length})</span>}
           </p>
-        </>
+          <p className="text-xs text-muted-foreground mt-0.5">
+            Embeddings are generated on next message from this tenant.
+          </p>
+        </div>
+        <AddSourceDialog tenantId={tenantId} onAdded={(doc) => setDocs((prev) => [doc, ...prev])} />
+      </div>
+
+      {loading && <p className="text-muted-foreground text-sm">Loading…</p>}
+      {error && <Notice type="error">{error}</Notice>}
+
+      {!loading && !error && docs.length === 0 && (
+        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-12 text-center">
+          <FileText className="size-10 text-muted-foreground/40" />
+          <div>
+            <p className="text-sm font-medium text-muted-foreground">No sources yet</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Add PDFs, websites, or text to build the knowledge base</p>
+          </div>
+        </div>
       )}
 
-      <Separator />
-
-      <div className="space-y-4">
-        <h3 className="text-sm font-semibold">Add Document</h3>
-        <form onSubmit={handleAddDoc} className="space-y-3">
-          <div className="flex gap-3 items-end">
-            <div className="flex-[3] space-y-1.5">
-              <Label htmlFor="doc-title">Title *</Label>
-              <Input
-                id="doc-title"
-                value={title}
-                onChange={(e) => setTitle(e.target.value)}
-                placeholder="Document title"
-              />
+      {!loading && !error && docs.length > 0 && (
+        <div className="divide-y rounded-lg border">
+          {docs.map((doc) => (
+            <div key={doc.id} className="flex items-center gap-3 px-4 py-3">
+              <div className="shrink-0">{sourceIcon(doc.file_type)}</div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium truncate">{doc.title ?? doc.file_name ?? '—'}</p>
+                {doc.file_type === 'website' && doc.file_name && (
+                  <p className="text-xs text-muted-foreground truncate">{doc.file_name}</p>
+                )}
+                <p className="text-xs text-muted-foreground">
+                  {doc.chunk_count} chunk{doc.chunk_count !== 1 ? 's' : ''} · {formatDate(doc.created_at)}
+                </p>
+              </div>
+              <Badge variant="outline" className="shrink-0 text-xs">
+                {doc.file_type ?? 'text'}
+              </Badge>
+              <button
+                onClick={() => deleteDoc(doc)}
+                className="shrink-0 text-muted-foreground hover:text-destructive transition-colors"
+                title="Delete source"
+              >
+                <Trash2 className="size-4" />
+              </button>
             </div>
-            <div className="flex-1 min-w-[120px] space-y-1.5">
-              <Label htmlFor="doc-type">File Type</Label>
-              <Select value={fileType} onValueChange={(v) => { if (v) { setFileType(v); setPdfFile(null) } }}>
-                <SelectTrigger id="doc-type" className="w-full">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="text">text</SelectItem>
-                  <SelectItem value="markdown">markdown</SelectItem>
-                  <SelectItem value="pdf">pdf</SelectItem>
-                </SelectContent>
-              </Select>
-            </div>
-          </div>
-          {fileType === 'pdf' ? (
-            <div className="space-y-1.5">
-              <Label htmlFor="doc-file">PDF File *</Label>
-              <Input
-                id="doc-file"
-                type="file"
-                accept=".pdf,application/pdf"
-                onChange={(e) => setPdfFile(e.target.files?.[0] ?? null)}
-                className="cursor-pointer"
-              />
-              {pdfFile && (
-                <p className="text-xs text-muted-foreground">{pdfFile.name} ({(pdfFile.size / 1024).toFixed(0)} KB)</p>
-              )}
-            </div>
-          ) : (
-            <div className="space-y-1.5">
-              <Label htmlFor="doc-content">Content *</Label>
-              <Textarea
-                id="doc-content"
-                className="min-h-[160px] font-mono text-sm"
-                value={content}
-                onChange={(e) => setContent(e.target.value)}
-                placeholder="Paste document content here…"
-              />
-            </div>
-          )}
-          <Button type="submit" disabled={adding}>
-            {adding ? 'Saving…' : 'Save Document'}
-          </Button>
-        </form>
-        {addNotice && <Notice type={addNotice.type}>{addNotice.msg}</Notice>}
-      </div>
+          ))}
+        </div>
+      )}
     </div>
   )
 }

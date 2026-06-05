@@ -7,6 +7,28 @@ interface RouteParams {
   params: Promise<{ id: string }>
 }
 
+function extractTextFromHtml(html: string): string {
+  return html
+    .replace(/<script[\s\S]*?<\/script>/gi, '')
+    .replace(/<style[\s\S]*?<\/style>/gi, '')
+    .replace(/<[^>]+>/g, ' ')
+    .replace(/&nbsp;/g, ' ')
+    .replace(/&amp;/g, '&')
+    .replace(/&lt;/g, '<')
+    .replace(/&gt;/g, '>')
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/\s{2,}/g, '\n')
+    .trim()
+}
+
+function detectFileType(filename: string): string {
+  const ext = filename.split('.').pop()?.toLowerCase()
+  if (ext === 'pdf') return 'pdf'
+  if (ext === 'md') return 'markdown'
+  return 'text'
+}
+
 export async function GET(_req: NextRequest, { params }: RouteParams) {
   const { id } = await params
   try {
@@ -42,18 +64,17 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
     let file_name: string | null = null
 
     if (contentType.includes('multipart/form-data')) {
+      // File upload (PDF, TXT, MD)
       const form = await req.formData()
-      title = (form.get('title') as string | null)?.trim() ?? ''
-      file_type = (form.get('file_type') as string | null) ?? null
       const file = form.get('file') as File | null
-
-      if (!file) {
-        return NextResponse.json({ error: 'No file uploaded' }, { status: 400 })
-      }
+      if (!file) return NextResponse.json({ error: 'No file uploaded' }, { status: 400 })
 
       file_name = file.name
-      const buf = Buffer.from(await file.arrayBuffer())
+      file_type = detectFileType(file.name)
+      const providedTitle = (form.get('title') as string | null)?.trim()
+      title = providedTitle || file.name.replace(/\.[^.]+$/, '')
 
+      const buf = Buffer.from(await file.arrayBuffer())
       if (file_type === 'pdf') {
         const parsed = await pdfParse(buf)
         content = parsed.text
@@ -62,12 +83,36 @@ export async function POST(req: NextRequest, { params }: RouteParams) {
       }
     } else {
       const body = await req.json()
-      title = (body.title as string | undefined)?.trim() ?? ''
-      content = (body.content as string | undefined)?.trim() ?? ''
-      file_type = body.file_type ?? null
+      const sourceType = (body.source_type as string | undefined) ?? 'text'
+
+      if (sourceType === 'website') {
+        const url = (body.url as string | undefined)?.trim()
+        if (!url) return NextResponse.json({ error: 'url is required' }, { status: 400 })
+
+        const response = await fetch(url, {
+          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; LineBot-KB/1.0)' },
+          signal: AbortSignal.timeout(15_000),
+        })
+        if (!response.ok) {
+          return NextResponse.json(
+            { error: `Could not fetch URL: HTTP ${response.status}` },
+            { status: 422 }
+          )
+        }
+        const html = await response.text()
+        const htmlTitle = html.match(/<title[^>]*>([^<]*)<\/title>/i)?.[1]?.trim()
+        title = (body.title as string | undefined)?.trim() || htmlTitle || url
+        content = extractTextFromHtml(html)
+        file_type = 'website'
+        file_name = url
+      } else {
+        title = (body.title as string | undefined)?.trim() ?? ''
+        content = (body.content as string | undefined)?.trim() ?? ''
+        file_type = (body.file_type as string | undefined) ?? 'text'
+      }
     }
 
-    if (!title || !content) {
+    if (!title || !content?.trim()) {
       return NextResponse.json({ error: 'title and content are required' }, { status: 400 })
     }
 
