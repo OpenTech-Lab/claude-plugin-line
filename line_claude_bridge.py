@@ -8,6 +8,7 @@ from contextlib import asynccontextmanager
 from typing import Optional
 
 import aiosqlite
+import asyncpg
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
@@ -34,6 +35,7 @@ SYSTEM_PROMPT = os.getenv(
     "You are a helpful assistant accessed via LINE messaging app. Keep replies concise (under 500 words).",
 )
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
+DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://linebot:linebot@localhost:5433/linebot")
 CLAUDE_MODE = os.getenv("CLAUDE_MODE", "false").lower() == "true"
 CLAUDE_CWD = os.getenv("CLAUDE_CWD", os.path.expanduser("~"))
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
@@ -46,6 +48,7 @@ CLAUDE_CODE_MODEL = os.getenv("CLAUDE_CODE_MODEL", "")  # e.g. claude-haiku-4-5-
 _raw = os.getenv("CLAUDE_ALLOWED_USERS", "")
 CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip()}
 HISTORY_LIMIT = 10  # rows = 5 user/assistant pairs
+MEM_CONTEXT_MAX_CHARS = 3000
 REPLY_MAX_CHARS = 4800
 
 logging.basicConfig(level=logging.INFO)
@@ -93,7 +96,14 @@ async def lifespan(app: FastAPI):
     os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
     async with aiosqlite.connect(DB_PATH) as db:
         await _init_db(db)
+    try:
+        app.state.pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
+    except Exception as e:
+        logger.warning("postgres pool unavailable, activity logging disabled: %s", e)
+        app.state.pg_pool = None
     yield
+    if app.state.pg_pool is not None:
+        await app.state.pg_pool.close()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -159,6 +169,39 @@ async def _clear_history(db: aiosqlite.Connection, user_id: str) -> None:
     await db.commit()
 
 
+async def _log_activity(
+    pool: Optional[asyncpg.Pool],
+    tenant_id: str,
+    user_id: str,
+    message_preview: str,
+    chunks_retrieved: int = 0,
+) -> None:
+    """Record chat activity for the dashboard (/tenants/{id} Activity tab).
+
+    New tenant_ids are queued in pending_tenants for admin approval rather
+    than auto-added to tenants.
+    """
+    if pool is None:
+        return
+    try:
+        async with pool.acquire() as conn:
+            tenant_exists = await conn.fetchval("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
+            if not tenant_exists:
+                tenant_type = "group" if tenant_id.startswith(("C", "R")) else "user"
+                await conn.execute(
+                    """INSERT INTO pending_tenants (id, type)
+                       VALUES ($1, $2) ON CONFLICT (id) DO NOTHING""",
+                    tenant_id, tenant_type,
+                )
+            await conn.execute(
+                """INSERT INTO activity_log (tenant_id, user_id, message_preview, chunks_retrieved)
+                   VALUES ($1, $2, $3, $4)""",
+                tenant_id, user_id, message_preview[:200], chunks_retrieved,
+            )
+    except Exception as e:
+        logger.warning("activity log failed: %s", e)
+
+
 async def _call_openrouter(
     model: str, messages: list[dict]
 ) -> Optional[str]:
@@ -191,6 +234,8 @@ async def _fetch_memory(query: str) -> str:
         result = stdout.decode().strip()
         err = stderr.decode().strip()
         logger.info("mem search rc=%s result_len=%d err=%s", proc.returncode, len(result), err[:100] if err else "")
+        if len(result) > MEM_CONTEXT_MAX_CHARS:
+            result = result[:MEM_CONTEXT_MAX_CHARS] + "\n... (truncated)"
         return result if result else ""
     except FileNotFoundError:
         logger.warning("mem CLI not found at %s", MEM_CLI)
@@ -266,7 +311,7 @@ def _send_reply(reply_token: str, text: str) -> None:
 
 
 async def _handle_text(
-    user_id: str, text: str, reply_token: str
+    user_id: str, tenant_id: str, text: str, reply_token: str, pg_pool: Optional[asyncpg.Pool]
 ) -> None:
     t0 = time.time()
     outcome = "ok"
@@ -357,6 +402,7 @@ async def _handle_text(
             # Reply token may have expired; log silently
             logger.warning("reply_failed user=%s err=%s", _uid_hash(user_id), str(e))
 
+        await _log_activity(pg_pool, tenant_id, user_id, text)
         _log(user_id, model, outcome, t0, len(history))
 
 
@@ -393,7 +439,13 @@ async def webhook(request: Request):
         if not isinstance(event.message, TextMessageContent):
             continue
 
-        user_id = event.source.user_id
+        source = event.source
+        tenant_id = (
+            getattr(source, "group_id", None)
+            or getattr(source, "room_id", None)
+            or source.user_id
+        )
+        user_id = getattr(source, "user_id", None) or tenant_id
         text = event.message.text.strip()
 
         if not text:
@@ -403,7 +455,7 @@ async def webhook(request: Request):
             _send_reply(event.reply_token, "Too many requests. Please slow down.")
             continue
 
-        await _handle_text(user_id, text, event.reply_token)
+        await _handle_text(user_id, tenant_id, text, event.reply_token, request.app.state.pg_pool)
 
     return {"status": "ok"}
 
