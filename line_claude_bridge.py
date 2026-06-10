@@ -34,6 +34,10 @@ SYSTEM_PROMPT = os.getenv(
     "SYSTEM_PROMPT",
     "You are a helpful assistant accessed via LINE messaging app. Keep replies concise (under 500 words).",
 )
+TENANT_INACTIVE_MESSAGE = os.getenv(
+    "TENANT_INACTIVE_MESSAGE",
+    "This assistant is currently unavailable. Please contact the administrator.",
+)
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://linebot:linebot@localhost:5433/linebot")
 CLAUDE_MODE = os.getenv("CLAUDE_MODE", "false").lower() == "true"
@@ -200,6 +204,30 @@ async def _log_activity(
             )
     except Exception as e:
         logger.warning("activity log failed: %s", e)
+
+
+async def _get_tenant_config(pool: Optional[asyncpg.Pool], tenant_id: str) -> dict:
+    """Fetch a tenant's persona settings, with safe defaults on any failure.
+
+    Defaults (`is_active=True`, `system_prompt=None`) reproduce today's
+    behavior for tenants with no row yet (e.g. still in pending_tenants)
+    and when Postgres is unreachable.
+    """
+    defaults = {"is_active": True, "system_prompt": None}
+    if pool is None:
+        return defaults
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                "SELECT is_active, system_prompt FROM tenants WHERE id = $1",
+                tenant_id,
+            )
+        if row is None:
+            return defaults
+        return {"is_active": row["is_active"], "system_prompt": row["system_prompt"]}
+    except Exception as e:
+        logger.warning("tenant config lookup failed tenant=%s err=%s", tenant_id, e)
+        return defaults
 
 
 async def _call_openrouter(
