@@ -1,12 +1,13 @@
 import pkg from 'pg';
 const { Pool } = pkg;
 
-if (!process.env.DATABASE_URL) {
-  throw new Error('DATABASE_URL environment variable is required');
-}
+// Same default as line_claude_bridge.py — throwing here would crash the MCP
+// channel server at import time in sessions where DATABASE_URL isn't set.
+const DATABASE_URL =
+  process.env.DATABASE_URL ?? 'postgresql://linebot:linebot@localhost:5433/linebot';
 
 const pool = new Pool({
-  connectionString: process.env.DATABASE_URL,
+  connectionString: DATABASE_URL,
 });
 
 pool.on('error', (err) => {
