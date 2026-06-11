@@ -276,7 +276,7 @@ async def _fetch_memory(query: str) -> str:
         return ""
 
 
-async def _call_claude_code(user_id: str, text: str) -> str:
+async def _call_claude_code(user_id: str, text: str, system_prompt: str) -> str:
     # Calls the local claude binary. Prompt is passed via stdin, not argv,
     # to prevent argument injection (flag smuggling via leading dashes).
     # Only users in CLAUDE_ALLOWED_USERS may reach this function.
@@ -287,8 +287,8 @@ async def _call_claude_code(user_id: str, text: str) -> str:
         memory_ctx = await _fetch_memory(text)
 
     parts = []
-    if SYSTEM_PROMPT:
-        parts.append(SYSTEM_PROMPT)
+    if system_prompt:
+        parts.append(system_prompt)
     if memory_ctx:
         parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
     parts.append(text)
@@ -396,7 +396,7 @@ async def _handle_text(
         history = await _get_history(db, user_id)
         if CLAUDE_MODE:
             model = "claude-code-local"
-            reply_text = await _call_claude_code(user_id, text)
+            reply_text = await _call_claude_code(user_id, text, SYSTEM_PROMPT)
             if "error" in reply_text.lower()[:20]:
                 outcome = "error"
             await _save_turn(db, user_id, text, reply_text)
