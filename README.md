@@ -157,6 +157,38 @@ You're ready — send messages from LINE and Claude Code responds.
 
 ---
 
+## Two ways to run
+
+Both modes bind **port 8000**, so the Cloudflare tunnel and LINE webhook URL
+never change. Run exactly one at a time — the second process fails fast with
+`EADDRINUSE` if the other is still up. The `line-tunnel` pm2 process must keep
+running in both modes; it carries the webhook traffic.
+
+### Production: pm2 bridge (multi-tenant FastAPI)
+
+```bash
+pm2 start line-bridge
+```
+
+Auto-starts on boot (`pm2-toyofumi.service`). Per-tenant personas, guardrails,
+and the dashboard all run through this path.
+
+### Terminal: interactive Claude Code session
+
+```bash
+pm2 stop line-bridge
+claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:line@personal
+```
+
+LINE messages arrive directly in the Claude Code session (same as the official
+Telegram channel). When done, restore production mode:
+
+```bash
+pm2 start line-bridge
+```
+
+---
+
 ## Group chats
 
 ### Enable group support in LINE console
