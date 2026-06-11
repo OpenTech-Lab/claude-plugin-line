@@ -344,6 +344,14 @@ async def _handle_text(
     t0 = time.time()
     outcome = "ok"
 
+    tenant_config = await _get_tenant_config(pg_pool, tenant_id)
+    if not tenant_config["is_active"]:
+        _send_reply(reply_token, TENANT_INACTIVE_MESSAGE)
+        _log(user_id, "-", "inactive", t0, 0)
+        return
+
+    effective_system_prompt = tenant_config["system_prompt"] or SYSTEM_PROMPT
+
     async with aiosqlite.connect(DB_PATH) as db:
         # Command dispatch
         if text == "/clear":
@@ -396,13 +404,13 @@ async def _handle_text(
         history = await _get_history(db, user_id)
         if CLAUDE_MODE:
             model = "claude-code-local"
-            reply_text = await _call_claude_code(user_id, text, SYSTEM_PROMPT)
+            reply_text = await _call_claude_code(user_id, text, effective_system_prompt)
             if "error" in reply_text.lower()[:20]:
                 outcome = "error"
             await _save_turn(db, user_id, text, reply_text)
         else:
             messages = (
-                [{"role": "system", "content": SYSTEM_PROMPT}]
+                [{"role": "system", "content": effective_system_prompt}]
                 + history
                 + [{"role": "user", "content": text}]
             )

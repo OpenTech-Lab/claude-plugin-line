@@ -103,3 +103,80 @@ async def test_call_claude_code_omits_empty_system_prompt(monkeypatch):
     await bridge._call_claude_code("Uabc", "hi", "")
 
     assert fake_proc.received_input.decode() == "hi"
+
+
+@pytest.mark.asyncio
+async def test_handle_text_inactive_tenant_sends_fixed_message(monkeypatch):
+    async def fake_get_tenant_config(pool, tenant_id):
+        return {"is_active": False, "system_prompt": None}
+
+    monkeypatch.setattr(bridge, "_get_tenant_config", fake_get_tenant_config)
+
+    sent = []
+    monkeypatch.setattr(bridge, "_send_reply", lambda token, text: sent.append((token, text)))
+
+    async def fail_if_called(*args, **kwargs):
+        raise AssertionError("should not be called for an inactive tenant")
+
+    monkeypatch.setattr(bridge, "_call_openrouter", fail_if_called)
+    monkeypatch.setattr(bridge, "_call_claude_code", fail_if_called)
+
+    await bridge._handle_text("Uabc", "Tabc", "hello", "reply-token", None)
+
+    assert sent == [("reply-token", bridge.TENANT_INACTIVE_MESSAGE)]
+
+
+@pytest.mark.asyncio
+async def test_handle_text_uses_tenant_system_prompt(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "conversations.db")
+    monkeypatch.setattr(bridge, "DB_PATH", db_path)
+    monkeypatch.setattr(bridge, "CLAUDE_MODE", False)
+
+    async with bridge.aiosqlite.connect(db_path) as db:
+        await bridge._init_db(db)
+
+    async def fake_get_tenant_config(pool, tenant_id):
+        return {"is_active": True, "system_prompt": "You are a pirate."}
+
+    monkeypatch.setattr(bridge, "_get_tenant_config", fake_get_tenant_config)
+
+    captured = {}
+
+    async def fake_call_openrouter(model, messages):
+        captured["messages"] = messages
+        return "Arrr, hello!"
+
+    monkeypatch.setattr(bridge, "_call_openrouter", fake_call_openrouter)
+    monkeypatch.setattr(bridge, "_send_reply", lambda token, text: None)
+
+    await bridge._handle_text("Uabc", "Tabc", "hello", "reply-token", None)
+
+    assert captured["messages"][0] == {"role": "system", "content": "You are a pirate."}
+
+
+@pytest.mark.asyncio
+async def test_handle_text_falls_back_to_global_system_prompt(monkeypatch, tmp_path):
+    db_path = str(tmp_path / "conversations.db")
+    monkeypatch.setattr(bridge, "DB_PATH", db_path)
+    monkeypatch.setattr(bridge, "CLAUDE_MODE", False)
+
+    async with bridge.aiosqlite.connect(db_path) as db:
+        await bridge._init_db(db)
+
+    async def fake_get_tenant_config(pool, tenant_id):
+        return {"is_active": True, "system_prompt": None}
+
+    monkeypatch.setattr(bridge, "_get_tenant_config", fake_get_tenant_config)
+
+    captured = {}
+
+    async def fake_call_openrouter(model, messages):
+        captured["messages"] = messages
+        return "hello!"
+
+    monkeypatch.setattr(bridge, "_call_openrouter", fake_call_openrouter)
+    monkeypatch.setattr(bridge, "_send_reply", lambda token, text: None)
+
+    await bridge._handle_text("Uabc", "Tabc", "hello", "reply-token", None)
+
+    assert captured["messages"][0] == {"role": "system", "content": bridge.SYSTEM_PROMPT}
