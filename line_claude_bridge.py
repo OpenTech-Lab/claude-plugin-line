@@ -327,6 +327,14 @@ async def _queue_pending(pool: Optional[asyncpg.Pool], tenant_id: str) -> bool:
     return inserted is not None
 
 
+def _defang_kb_markers(text: str) -> str:
+    # KB text can come from websites/PDFs; keep it from forging the block's
+    # delimiters and "closing" the reference-data section early.
+    return text.replace("[End knowledge base", "(End knowledge base").replace(
+        "[Knowledge base", "(Knowledge base"
+    )
+
+
 async def _get_kb_context(pool: Optional[asyncpg.Pool], tenant_id: str) -> tuple[str, int]:
     """Build the tenant's knowledge-base block for the system prompt.
 
@@ -353,10 +361,11 @@ async def _get_kb_context(pool: Optional[asyncpg.Pool], tenant_id: str) -> tuple
     sections: list[str] = []
     used = 0
     for row in rows:
-        content = (row["content"] or "").strip()
+        content = _defang_kb_markers((row["content"] or "").strip())
         if not content:
             continue
-        heading = f"## {(row['title'] or '').strip() or 'Untitled'}\n"
+        title = _defang_kb_markers((row['title'] or '').strip())
+        heading = f"## {title or 'Untitled'}\n"
         sep = 2 if sections else 0  # the "\n\n" joining sections
         section = heading + content
         remaining = KB_CONTEXT_MAX_CHARS - used - sep
