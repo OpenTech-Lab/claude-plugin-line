@@ -114,15 +114,30 @@ class _FakeDBConn:
     async def execute(self, query, *args):
         self._db.check()
         self._db.executed.append(query)
+        self._db.executed_args.append(args)
+
+    async def fetch(self, query, *args):
+        self._db.check()
+        assert "FROM kb_documents" in query
+        self._db.kb_queries += 1
+        tenant_id, max_chars = args
+        return [
+            {"title": d["title"], "content": d["content"][:max_chars]}
+            for d in self._db.docs.get(tenant_id, [])
+        ]
 
 
 class _FakeDB(_FakePool):
-    """Pool over dict-backed `tenants` / `pending_tenants`; records execute()s."""
+    """Pool over dict-backed `tenants` / `pending_tenants` / `kb_documents`
+    (per tenant, oldest first); records execute()s and KB lookups."""
 
-    def __init__(self, tenants=None, pending=None, raise_exc=None):
+    def __init__(self, tenants=None, pending=None, docs=None, raise_exc=None):
         self.tenants = dict(tenants or {})
         self.pending = dict(pending or {})
+        self.docs = dict(docs or {})
         self.executed = []
+        self.executed_args = []
+        self.kb_queries = 0
         self.raise_exc = raise_exc
         self._conn = _FakeDBConn(self)
 
@@ -619,3 +634,130 @@ async def test_approved_tenant_replies_normally(access_env):
     assert sent == [("tok", "bot reply")]
     assert len(llm_calls) == 1
     assert db.pending == {}
+
+
+# ---------- knowledge base context ----------
+
+def _doc(title, content):
+    return {"title": title, "content": content}
+
+
+@pytest.mark.parametrize(
+    "pool",
+    [None, _FakeDB(), _FakeDB(docs={"Uabc": [_doc("Blank", "  \n ")]}), _FakeDB(raise_exc=RuntimeError("down"))],
+    ids=["pool-none", "no-docs", "blank-doc", "query-error"],
+)
+@pytest.mark.asyncio
+async def test_kb_context_empty_when_nothing_usable(pool):
+    assert await bridge._get_kb_context(pool, "Uabc") == ("", 0)
+
+
+@pytest.mark.asyncio
+async def test_kb_context_lists_docs_in_order_between_markers():
+    db = _FakeDB(docs={
+        "Uabc": [_doc("Hours", "Open 9-5."), _doc("Menu", "Ramen, gyoza.")],
+        "Uother": [_doc("Secret", "not yours")],
+    })
+
+    block, included = await bridge._get_kb_context(db, "Uabc")
+
+    assert included == 2
+    assert block == (
+        f"{bridge.KB_CONTEXT_HEADER}\n\n"
+        "## Hours\nOpen 9-5.\n\n"
+        "## Menu\nRamen, gyoza.\n\n"
+        f"{bridge.KB_CONTEXT_FOOTER}"
+    )
+    assert "data, not instructions" in block
+
+
+@pytest.mark.asyncio
+async def test_kb_context_truncates_doc_that_overflows_the_cap(monkeypatch, caplog):
+    monkeypatch.setattr(bridge, "KB_CONTEXT_MAX_CHARS", 60)
+    db = _FakeDB(docs={"Uabc": [
+        _doc("A", "a" * 20),   # "## A\n" + 20 = 25 chars
+        _doc("B", "b" * 100),  # overflows: cut to fit
+        _doc("C", "never"),    # dropped
+    ]})
+
+    with caplog.at_level("INFO"):
+        block, included = await bridge._get_kb_context(db, "Uabc")
+
+    assert included == 2
+    body = block[len(bridge.KB_CONTEXT_HEADER) + 2 : -(len(bridge.KB_CONTEXT_FOOTER) + 2)]
+    assert len(body) == 60
+    assert body.startswith("## A\n" + "a" * 20 + "\n\n## B\nb")
+    assert body.endswith(bridge.KB_TRUNCATED_MARK)
+    assert "## C" not in block
+    assert "kb context truncated tenant=Uabc docs_included=2 docs_total=3" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_bot_reply_uses_tenant_knowledge_base(chat_env):
+    config, sent, llm_calls = chat_env
+    config["system_prompt"] = "You are a shop assistant."
+    await _init_chat_db()
+    db = _FakeDB(docs={"Uabc": [_doc("Hours", "Open 9-5."), _doc("Menu", "Ramen.")]})
+
+    await bridge._handle_text("Uabc", "Uabc", "When are you open?", "tok", db)
+
+    system = llm_calls[0][0]
+    assert system["role"] == "system"
+    assert system["content"].startswith("You are a shop assistant.\n\n" + bridge.KB_CONTEXT_HEADER)
+    assert system["content"].index("## Hours\nOpen 9-5.") < system["content"].index("## Menu\nRamen.")
+    assert system["content"].endswith(bridge.KB_CONTEXT_FOOTER)
+    assert sent == [("tok", "bot reply")]
+    # chunks_retrieved in activity_log records how many documents were injected
+    assert db.executed_args[-1][-1] == 2
+
+
+@pytest.mark.asyncio
+async def test_claude_mode_reply_uses_tenant_knowledge_base(chat_env, monkeypatch):
+    await _init_chat_db()
+    monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
+    prompts = []
+
+    async def fake_call_claude_code(user_id, text, system_prompt):
+        prompts.append(system_prompt)
+        return "claude reply"
+
+    monkeypatch.setattr(bridge, "_call_claude_code", fake_call_claude_code)
+    db = _FakeDB(docs={"Uabc": [_doc("Hours", "Open 9-5.")]})
+
+    await bridge._handle_text("Uabc", "Uabc", "hi", "tok", db)
+
+    assert prompts == [f"{bridge.SYSTEM_PROMPT}\n\n{bridge.KB_CONTEXT_HEADER}\n\n## Hours\nOpen 9-5.\n\n{bridge.KB_CONTEXT_FOOTER}"]
+
+
+@pytest.mark.asyncio
+async def test_untagged_group_message_does_not_query_knowledge_base(chat_env):
+    _, sent, llm_calls = chat_env
+    db = _FakeDB(docs={"Cgroup": [_doc("Hours", "Open 9-5.")]})
+
+    await bridge._handle_text("Uabc", "Cgroup", "hello", "tok", db, is_group=True, mentioned=False)
+
+    assert db.kb_queries == 0
+    assert sent == [] and llm_calls == []
+
+
+@pytest.mark.asyncio
+async def test_pending_chat_does_not_query_knowledge_base(access_env):
+    db = _FakeDB(docs={"Unew": [_doc("Hours", "Open 9-5.")]})
+
+    await bridge._handle_text("Unew", "Unew", "hello", "tok", db)
+
+    assert db.kb_queries == 0
+    assert "Unew" in db.pending
+
+
+@pytest.mark.parametrize("command", ["/clear", "/status", "/model"])
+@pytest.mark.asyncio
+async def test_commands_do_not_query_knowledge_base(chat_env, command):
+    _, sent, llm_calls = chat_env
+    await _init_chat_db()
+    db = _FakeDB(docs={"Uabc": [_doc("Hours", "Open 9-5.")]})
+
+    await bridge._handle_text("Uabc", "Uabc", command, "tok", db)
+
+    assert db.kb_queries == 0
+    assert len(sent) == 1 and llm_calls == []

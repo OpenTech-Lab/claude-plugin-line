@@ -41,6 +41,7 @@ import {
   File,
   FileType2,
   Plus,
+  Pencil,
   Trash2,
 } from 'lucide-react'
 import { cn } from '@/lib/utils'
@@ -452,6 +453,127 @@ function AddSourceDialog({
   )
 }
 
+// ---------- Edit Source Dialog ----------
+function EditSourceDialog({
+  tenantId,
+  doc,
+  onSaved,
+}: {
+  tenantId: string
+  doc: Document
+  onSaved: (doc: Document) => void
+}) {
+  const [open, setOpen] = useState(false)
+  const [title, setTitle] = useState('')
+  const [content, setContent] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [saving, setSaving] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+
+  const docUrl = `/api/tenants/${encodeURIComponent(tenantId)}/documents/${doc.id}`
+
+  async function load() {
+    setLoading(true)
+    setError(null)
+    try {
+      const res = await fetch(docUrl)
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+      setTitle(data.title ?? '')
+      setContent(data.content ?? '')
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setLoading(false)
+    }
+  }
+
+  function handleOpenChange(v: boolean) {
+    setOpen(v)
+    if (v) {
+      setTitle('')
+      setContent('')
+      load()
+    }
+  }
+
+  async function handleSave() {
+    setError(null)
+    if (!title.trim() || !content.trim()) { setError('Title and content are required.'); return }
+    setSaving(true)
+    try {
+      const res = await fetch(docUrl, {
+        method: 'PUT',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title: title.trim(), content: content.trim() }),
+      })
+      const data = await res.json()
+      if (!res.ok) throw new Error(data.error ?? `HTTP ${res.status}`)
+      onSaved(data)
+      setOpen(false)
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err))
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  return (
+    <Dialog open={open} onOpenChange={handleOpenChange}>
+      <DialogTrigger asChild>
+        <button
+          className="shrink-0 text-muted-foreground hover:text-foreground transition-colors"
+          title="Edit source"
+        >
+          <Pencil className="size-4" />
+        </button>
+      </DialogTrigger>
+      <DialogContent className="sm:max-w-2xl">
+        <DialogHeader>
+          <DialogTitle>Edit source</DialogTitle>
+        </DialogHeader>
+
+        {loading ? (
+          <p className="text-muted-foreground text-sm">Loading…</p>
+        ) : (
+          <div className="space-y-3 mt-2">
+            <div className="space-y-1.5">
+              <Label>Title *</Label>
+              <Input
+                value={title}
+                onChange={(e) => setTitle(e.target.value)}
+                placeholder="Source title"
+              />
+            </div>
+            <div className="space-y-1.5">
+              <div className="flex items-center justify-between">
+                <Label>Content *</Label>
+                <span className="text-xs text-muted-foreground">
+                  {content.length.toLocaleString()} characters
+                </span>
+              </div>
+              <Textarea
+                className="min-h-[320px] max-h-[60vh] font-mono text-sm"
+                value={content}
+                onChange={(e) => setContent(e.target.value)}
+              />
+            </div>
+          </div>
+        )}
+
+        {error && <Notice type="error">{error}</Notice>}
+
+        <div className="flex justify-end gap-2 mt-2">
+          <Button variant="outline" onClick={() => setOpen(false)}>Cancel</Button>
+          <Button onClick={handleSave} disabled={loading || saving}>
+            {saving ? 'Saving…' : 'Save'}
+          </Button>
+        </div>
+      </DialogContent>
+    </Dialog>
+  )
+}
+
 // ---------- Knowledge Base Tab ----------
 function KnowledgeTab({ tenantId }: { tenantId: string }) {
   const [docs, setDocs] = useState<Document[]>([])
@@ -496,7 +618,7 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
             Sources {!loading && docs.length > 0 && <span className="text-muted-foreground font-normal">({docs.length})</span>}
           </p>
           <p className="text-xs text-muted-foreground mt-0.5">
-            Embeddings are generated on next message from this tenant.
+            The bot reads these sources when it replies (oldest first, up to 8,000 characters in total).
           </p>
         </div>
         <AddSourceDialog tenantId={tenantId} onAdded={(doc) => setDocs((prev) => [doc, ...prev])} />
@@ -526,12 +648,17 @@ function KnowledgeTab({ tenantId }: { tenantId: string }) {
                   <p className="text-xs text-muted-foreground truncate">{doc.file_name}</p>
                 )}
                 <p className="text-xs text-muted-foreground">
-                  {doc.chunk_count} chunk{doc.chunk_count !== 1 ? 's' : ''} · {formatDate(doc.created_at)}
+                  {formatDate(doc.created_at)}
                 </p>
               </div>
               <Badge variant="outline" className="shrink-0 text-xs">
                 {doc.file_type ?? 'text'}
               </Badge>
+              <EditSourceDialog
+                tenantId={tenantId}
+                doc={doc}
+                onSaved={(saved) => setDocs((prev) => prev.map((d) => (d.id === saved.id ? { ...d, ...saved } : d)))}
+              />
               <button
                 onClick={() => deleteDoc(doc)}
                 className="shrink-0 text-muted-foreground hover:text-destructive transition-colors"
@@ -828,7 +955,7 @@ function ActivityTab({ tenantId }: { tenantId: string }) {
           <TableHead>Timestamp</TableHead>
           <TableHead>User ID</TableHead>
           <TableHead>Message Preview</TableHead>
-          <TableHead>Chunks Retrieved</TableHead>
+          <TableHead>KB Docs Used</TableHead>
         </TableRow>
       </TableHeader>
       <TableBody>
