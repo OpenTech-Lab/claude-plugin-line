@@ -93,9 +93,12 @@ _background_tasks: set[asyncio.Task] = set()
 # for up to ~15.5 minutes, so the TTL must outlast that window.
 _seen_event_ids: dict[str, float] = {}
 SEEN_EVENT_TTL = 3600
-# tenant_id -> last config read from `tenants`. Lets approved chats keep
-# working through a Postgres outage; unknown chats fail closed.
-_tenant_config_cache: dict[str, dict] = {}
+# tenant_id -> (last config read from `tenants`, monotonic time read). Lets
+# approved chats ride out a short Postgres outage; unknown chats fail closed.
+# Entries expire so a tenant revoked in the dashboard can't keep access
+# indefinitely through an outage.
+_tenant_config_cache: dict[str, tuple[dict, float]] = {}
+TENANT_CACHE_TTL = 600
 
 START_TIME = time.time()
 
@@ -331,8 +334,8 @@ async def _get_tenant_config(
     approve action creates it). Returns (APPROVED, config) for a row,
     (UNKNOWN, None) when there is none, and (UNAVAILABLE, None) when
     Postgres can't be queried. On an unavailable lookup the last-known
-    config is returned as APPROVED if cached; otherwise callers must fail
-    closed.
+    config is returned as APPROVED if it was read within TENANT_CACHE_TTL;
+    otherwise callers must fail closed.
     """
     if pool is not None:
         try:
@@ -352,11 +355,11 @@ async def _get_tenant_config(
                 "system_prompt": row["system_prompt"],
                 "reply_mode": row["reply_mode"],
             }
-            _tenant_config_cache[tenant_id] = config
+            _tenant_config_cache[tenant_id] = (config, time.monotonic())
             return TenantStatus.APPROVED, dict(config)
     cached = _tenant_config_cache.get(tenant_id)
-    if cached is not None:
-        return TenantStatus.APPROVED, dict(cached)
+    if cached is not None and time.monotonic() - cached[1] < TENANT_CACHE_TTL:
+        return TenantStatus.APPROVED, dict(cached[0])
     logger.warning("tenant_lookup_unavailable tenant=%s", tenant_id)
     return TenantStatus.UNAVAILABLE, None
 

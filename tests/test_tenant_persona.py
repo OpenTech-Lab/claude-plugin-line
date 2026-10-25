@@ -48,12 +48,12 @@ PIRATE_ROW = {"is_active": False, "system_prompt": "You are a pirate.", "reply_m
 async def test_get_tenant_config_row_means_approved_and_is_cached():
     status, config = await bridge._get_tenant_config(_FakePool(row=PIRATE_ROW), "Uabc")
     assert (status, config) == (APPROVED, PIRATE_ROW)
-    assert bridge._tenant_config_cache["Uabc"] == PIRATE_ROW
+    assert bridge._tenant_config_cache["Uabc"][0] == PIRATE_ROW
 
 
 @pytest.mark.asyncio
 async def test_get_tenant_config_no_row_means_unknown_and_evicts_cache():
-    bridge._tenant_config_cache["Uabc"] = dict(PIRATE_ROW)
+    bridge._tenant_config_cache["Uabc"] = (dict(PIRATE_ROW), bridge.time.monotonic())
     status, config = await bridge._get_tenant_config(_FakePool(row=None), "Uabc")
     assert (status, config) == (UNKNOWN, None)
     assert "Uabc" not in bridge._tenant_config_cache
@@ -66,9 +66,17 @@ async def test_get_tenant_config_no_row_means_unknown_and_evicts_cache():
 )
 @pytest.mark.asyncio
 async def test_get_tenant_config_unavailable_uses_cached_config(pool):
-    bridge._tenant_config_cache["Uabc"] = dict(PIRATE_ROW)
+    bridge._tenant_config_cache["Uabc"] = (dict(PIRATE_ROW), bridge.time.monotonic())
     status, config = await bridge._get_tenant_config(pool, "Uabc")
     assert (status, config) == (APPROVED, PIRATE_ROW)
+
+
+@pytest.mark.asyncio
+async def test_get_tenant_config_unavailable_ignores_expired_cache():
+    stale = bridge.time.monotonic() - bridge.TENANT_CACHE_TTL - 1
+    bridge._tenant_config_cache["Uabc"] = (dict(PIRATE_ROW), stale)
+    status, config = await bridge._get_tenant_config(None, "Uabc")
+    assert (status, config) == (UNAVAILABLE, None)
 
 
 @pytest.mark.parametrize(
