@@ -123,7 +123,7 @@ cloudflared tunnel --url http://localhost:8000
 In a **dedicated terminal**, run:
 
 ```bash
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:line@personal
+claude --dangerously-skip-permissions --settings '{"enabledPlugins":{"line@personal":true}}' --dangerously-load-development-channels plugin:line@personal
 ```
 
 This starts Claude Code in channel-only mode — no interactive session, just LINE message handling. Leave this terminal running.
@@ -136,6 +136,8 @@ curl http://localhost:8000/health
 ```
 
 > **Note:** `--dangerously-load-development-channels` both registers the channel **and** bypasses the plugin allowlist. Pass the channel name to this flag only — do **not** also pass `--channels`, which creates a duplicate non-dev entry that fails with "not on the approved channels allowlist". The `allowedChannelPlugins` setting in settings.json is enterprise-only and has no effect for personal plugins.
+>
+> `line@personal` stays **disabled** in `~/.claude/settings.json` so ordinary Claude sessions don't each spawn a server on port 8000. The channel flag does not enable a disabled plugin — without the `--settings` override the session starts, but the LINE MCP server never launches and nothing listens on 8000.
 
 ### 6. Pair your LINE account
 
@@ -177,7 +179,7 @@ and the dashboard all run through this path.
 
 ```bash
 pm2 stop line-bridge
-claude --dangerously-skip-permissions --dangerously-load-development-channels plugin:line@personal
+claude --dangerously-skip-permissions --settings '{"enabledPlugins":{"line@personal":true}}' --dangerously-load-development-channels plugin:line@personal
 ```
 
 LINE messages arrive directly in the Claude Code session (same as the official
