@@ -5,6 +5,7 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
+from enum import Enum
 from typing import Optional
 
 import aiosqlite
@@ -19,10 +20,18 @@ from linebot.v3.messaging import (
     ApiClient,
     Configuration,
     MessagingApi,
+    PushMessageRequest,
     ReplyMessageRequest,
+    ShowLoadingAnimationRequest,
     TextMessage,
 )
-from linebot.v3.webhooks import MessageEvent, TextMessageContent
+from linebot.v3.webhooks import (
+    EventMode,
+    FollowEvent,
+    JoinEvent,
+    MessageEvent,
+    TextMessageContent,
+)
 
 load_dotenv()
 
@@ -37,6 +46,10 @@ SYSTEM_PROMPT = os.getenv(
 TENANT_INACTIVE_MESSAGE = os.getenv(
     "TENANT_INACTIVE_MESSAGE",
     "This assistant is currently unavailable. Please contact the administrator.",
+)
+PENDING_APPROVAL_MESSAGE = os.getenv(
+    "PENDING_APPROVAL_MESSAGE",
+    "This chat is awaiting admin approval.",
 )
 DB_PATH = os.getenv("DB_PATH", "data/conversations.db")
 DATABASE_URL = os.getenv("DATABASE_URL", "postgresql://linebot:linebot@localhost:5433/linebot")
@@ -54,6 +67,9 @@ CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip(
 HISTORY_LIMIT = 10  # rows = 5 user/assistant pairs
 MEM_CONTEXT_MAX_CHARS = 3000
 REPLY_MAX_CHARS = 4800
+# When a reply token has already expired/been used, fall back to a push message.
+# Push messages count against the channel's monthly quota, so this is opt-in.
+PUSH_FALLBACK = os.getenv("PUSH_FALLBACK", "false").lower() == "true"
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -69,6 +85,17 @@ _rate_store: dict[str, list[float]] = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
 PG_RETRY_INTERVAL = 30  # seconds between postgres reconnect attempts
+
+# Webhook events are processed in background tasks so the handler can ack
+# LINE within its 2s deadline. Strong refs keep the tasks from being GC'd.
+_background_tasks: set[asyncio.Task] = set()
+# webhookEventId -> monotonic time first seen. LINE redelivers unacked events
+# for up to ~15.5 minutes, so the TTL must outlast that window.
+_seen_event_ids: dict[str, float] = {}
+SEEN_EVENT_TTL = 3600
+# tenant_id -> last config read from `tenants`. Lets approved chats keep
+# working through a Postgres outage; unknown chats fail closed.
+_tenant_config_cache: dict[str, dict] = {}
 
 START_TIME = time.time()
 
@@ -145,6 +172,58 @@ def _is_rate_limited(user_id: str) -> bool:
     return False
 
 
+def _on_task_done(task: asyncio.Task) -> None:
+    _background_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.error("event task failed: %s", exc, exc_info=exc)
+
+
+def _spawn(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _background_tasks.add(task)
+    task.add_done_callback(_on_task_done)
+    return task
+
+
+def _is_duplicate_event(event_id: str) -> bool:
+    # Synchronous check-and-insert (no await), so concurrent webhook requests
+    # on the event loop cannot both see the same id as new.
+    now = time.monotonic()
+    for eid, seen_at in list(_seen_event_ids.items()):
+        if now - seen_at >= SEEN_EVENT_TTL:
+            del _seen_event_ids[eid]
+    if event_id in _seen_event_ids:
+        return True
+    _seen_event_ids[event_id] = now
+    return False
+
+
+def _strip_self_mentions(message: TextMessageContent) -> tuple[str, bool]:
+    """Remove @mentions of this bot from the text.
+
+    Returns (text, mentioned). LINE's mention index/length are in UTF-16 code
+    units, so slicing happens on the UTF-16 encoding. @All does not count.
+    """
+    text = message.text
+    mentionees = message.mention.mentionees if message.mention else []
+    spans = [
+        (m.index, m.length)
+        for m in mentionees
+        if getattr(m, "is_self", None) is True
+    ]
+    if not spans:
+        return text, False
+    buf = text.encode("utf-16-le")
+    for index, length in sorted(spans, reverse=True):
+        start, end = index * 2, (index + length) * 2
+        if buf[start:end].decode("utf-16-le", errors="replace").startswith("@"):
+            buf = buf[:start] + buf[end:]
+    return buf.decode("utf-16-le", errors="replace"), True
+
+
 def _uid_hash(user_id: str) -> str:
     return hashlib.sha256(user_id.encode()).hexdigest()[:8]
 
@@ -200,23 +279,11 @@ async def _log_activity(
     message_preview: str,
     chunks_retrieved: int = 0,
 ) -> None:
-    """Record chat activity for the dashboard (/tenants/{id} Activity tab).
-
-    New tenant_ids are queued in pending_tenants for admin approval rather
-    than auto-added to tenants.
-    """
+    """Record chat activity for the dashboard (/tenants/{id} Activity tab)."""
     if pool is None:
         return
     try:
         async with pool.acquire() as conn:
-            tenant_exists = await conn.fetchval("SELECT 1 FROM tenants WHERE id = $1", tenant_id)
-            if not tenant_exists:
-                tenant_type = "group" if tenant_id.startswith(("C", "R")) else "user"
-                await conn.execute(
-                    """INSERT INTO pending_tenants (id, type)
-                       VALUES ($1, $2) ON CONFLICT (id) DO NOTHING""",
-                    tenant_id, tenant_type,
-                )
             await conn.execute(
                 """INSERT INTO activity_log (tenant_id, user_id, message_preview, chunks_retrieved)
                    VALUES ($1, $2, $3, $4)""",
@@ -226,28 +293,72 @@ async def _log_activity(
         logger.warning("activity log failed: %s", e)
 
 
-async def _get_tenant_config(pool: Optional[asyncpg.Pool], tenant_id: str) -> dict:
-    """Fetch a tenant's persona settings, with safe defaults on any failure.
+async def _queue_pending(pool: Optional[asyncpg.Pool], tenant_id: str) -> bool:
+    """Queue an unapproved tenant in pending_tenants for admin review.
 
-    Defaults (`is_active=True`, `system_prompt=None`) reproduce today's
-    behavior for tenants with no row yet (e.g. still in pending_tenants)
-    and when Postgres is unreachable.
+    Returns True only when this call inserted the row, so callers can send
+    the approval notice once per chat.
     """
-    defaults = {"is_active": True, "system_prompt": None}
     if pool is None:
-        return defaults
+        logger.warning("pending queue skipped, no postgres pool tenant=%s", tenant_id)
+        return False
+    tenant_type = "group" if tenant_id.startswith(("C", "R")) else "user"
     try:
         async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT is_active, system_prompt FROM tenants WHERE id = $1",
-                tenant_id,
+            inserted = await conn.fetchval(
+                """INSERT INTO pending_tenants (id, type)
+                   VALUES ($1, $2) ON CONFLICT (id) DO NOTHING RETURNING id""",
+                tenant_id, tenant_type,
             )
-        if row is None:
-            return defaults
-        return {"is_active": row["is_active"], "system_prompt": row["system_prompt"]}
     except Exception as e:
-        logger.warning("tenant config lookup failed tenant=%s err=%s", tenant_id, e)
-        return defaults
+        logger.warning("pending queue failed tenant=%s err=%s", tenant_id, e)
+        return False
+    return inserted is not None
+
+
+class TenantStatus(Enum):
+    APPROVED = "approved"  # a `tenants` row exists (or was cached)
+    UNKNOWN = "unknown"  # no row: never approved, pending or denied
+    UNAVAILABLE = "unavailable"  # lookup failed and nothing is cached
+
+
+async def _get_tenant_config(
+    pool: Optional[asyncpg.Pool], tenant_id: str
+) -> tuple[TenantStatus, Optional[dict]]:
+    """Look up a tenant's approval and persona settings.
+
+    A tenant is approved iff it has a row in `tenants` (the dashboard's
+    approve action creates it). Returns (APPROVED, config) for a row,
+    (UNKNOWN, None) when there is none, and (UNAVAILABLE, None) when
+    Postgres can't be queried. On an unavailable lookup the last-known
+    config is returned as APPROVED if cached; otherwise callers must fail
+    closed.
+    """
+    if pool is not None:
+        try:
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT is_active, system_prompt, reply_mode FROM tenants WHERE id = $1",
+                    tenant_id,
+                )
+        except Exception as e:
+            logger.warning("tenant config lookup failed tenant=%s err=%s", tenant_id, e)
+        else:
+            if row is None:
+                _tenant_config_cache.pop(tenant_id, None)
+                return TenantStatus.UNKNOWN, None
+            config = {
+                "is_active": row["is_active"],
+                "system_prompt": row["system_prompt"],
+                "reply_mode": row["reply_mode"],
+            }
+            _tenant_config_cache[tenant_id] = config
+            return TenantStatus.APPROVED, dict(config)
+    cached = _tenant_config_cache.get(tenant_id)
+    if cached is not None:
+        return TenantStatus.APPROVED, dict(cached)
+    logger.warning("tenant_lookup_unavailable tenant=%s", tenant_id)
+    return TenantStatus.UNAVAILABLE, None
 
 
 async def _call_openrouter(
@@ -358,17 +469,80 @@ def _send_reply(reply_token: str, text: str) -> None:
         )
 
 
+def _send_push(to: str, text: str) -> None:
+    text = text[:REPLY_MAX_CHARS]
+    with ApiClient(line_config) as api_client:
+        MessagingApi(api_client).push_message(
+            PushMessageRequest(
+                to=to,
+                messages=[TextMessage(type="text", text=text)],
+            )
+        )
+
+
+async def _send_pending_notice(reply_token: str, tenant_id: str) -> None:
+    try:
+        await asyncio.to_thread(_send_reply, reply_token, PENDING_APPROVAL_MESSAGE)
+    except Exception as e:
+        logger.warning("pending_notice_failed tenant=%s err=%s", tenant_id, e)
+
+
+def _show_loading(user_id: str) -> None:
+    # Only supported in 1:1 chats; failures are cosmetic.
+    try:
+        with ApiClient(line_config) as api_client:
+            MessagingApi(api_client).show_loading_animation(
+                ShowLoadingAnimationRequest(chat_id=user_id, loading_seconds=60)
+            )
+    except Exception as e:
+        logger.warning("loading_animation_failed user=%s err=%s", _uid_hash(user_id), e)
+
+
 async def _handle_text(
-    user_id: str, tenant_id: str, text: str, reply_token: str, pg_pool: Optional[asyncpg.Pool]
+    user_id: str,
+    tenant_id: str,
+    text: str,
+    reply_token: str,
+    pg_pool: Optional[asyncpg.Pool],
+    *,
+    is_group: bool = False,
+    mentioned: bool = False,
 ) -> None:
     t0 = time.time()
     outcome = "ok"
 
-    tenant_config = await _get_tenant_config(pg_pool, tenant_id)
+    status, tenant_config = await _get_tenant_config(pg_pool, tenant_id)
+    if status is TenantStatus.UNKNOWN:
+        # Untagged group chatter is queued silently; the notice goes out once,
+        # when the row is first inserted. Pending/denied chats hit the
+        # ON CONFLICT and stay silent.
+        newly_queued = await _queue_pending(pg_pool, tenant_id)
+        if newly_queued and (not is_group or mentioned):
+            await _send_pending_notice(reply_token, tenant_id)
+        _log(user_id, "-", "pending", t0, 0)
+        return
+    if status is TenantStatus.UNAVAILABLE:
+        _log(user_id, "-", "unavailable", t0, 0)
+        return
+
+    if is_group and tenant_config.get("reply_mode") != "all" and not mentioned:
+        _log(user_id, "-", "not_mentioned", t0, 0)
+        return
+
+    if _is_rate_limited(user_id):
+        await asyncio.to_thread(_send_reply, reply_token, "Too many requests. Please slow down.")
+        _log(user_id, "-", "rate_limited", t0, 0)
+        return
+
     if not tenant_config["is_active"]:
-        _send_reply(reply_token, TENANT_INACTIVE_MESSAGE)
+        await asyncio.to_thread(_send_reply, reply_token, TENANT_INACTIVE_MESSAGE)
         _log(user_id, "-", "inactive", t0, 0)
         return
+
+    # Only past the approval/mention/rate gates, so ignored chats never see
+    # a typing indicator. LINE supports it in 1:1 chats only.
+    if not is_group:
+        await asyncio.to_thread(_show_loading, user_id)
 
     effective_system_prompt = tenant_config["system_prompt"] or SYSTEM_PROMPT
 
@@ -376,7 +550,7 @@ async def _handle_text(
         # Command dispatch
         if text == "/clear":
             await _clear_history(db, user_id)
-            _send_reply(reply_token, "History cleared.")
+            await asyncio.to_thread(_send_reply, reply_token, "History cleared.")
             outcome = "command"
             _log(user_id, await _get_model(db, user_id), outcome, t0, 0)
             return
@@ -385,19 +559,22 @@ async def _handle_text(
             parts = text.split(None, 1)
             if len(parts) < 2 or not parts[1].strip():
                 current = await _get_model(db, user_id)
-                _send_reply(reply_token, f"Usage: /model <name>  (current: {current})")
+                await asyncio.to_thread(
+                    _send_reply, reply_token, f"Usage: /model <name>  (current: {current})"
+                )
             else:
                 new_model = parts[1].strip()
                 # Basic validation: must contain a slash (e.g. "provider/name")
                 if "/" not in new_model:
                     current = await _get_model(db, user_id)
-                    _send_reply(
+                    await asyncio.to_thread(
+                        _send_reply,
                         reply_token,
                         f"Unknown model '{new_model}'. Use format provider/name. Keeping {current}.",
                     )
                 else:
                     await _set_model(db, user_id, new_model)
-                    _send_reply(reply_token, f"Model set to {new_model}.")
+                    await asyncio.to_thread(_send_reply, reply_token, f"Model set to {new_model}.")
             outcome = "command"
             _log(user_id, await _get_model(db, user_id), outcome, t0, 0)
             return
@@ -410,7 +587,8 @@ async def _handle_text(
                 row = await cursor.fetchone()
             count = row[0] if row else 0
             uptime_s = int(time.time() - START_TIME)
-            _send_reply(
+            await asyncio.to_thread(
+                _send_reply,
                 reply_token,
                 f"Model: {model}\nHistory rows: {count}\nUptime: {uptime_s}s",
             )
@@ -453,10 +631,18 @@ async def _handle_text(
                 outcome = "error"
 
         try:
-            _send_reply(reply_token, reply_text)
+            await asyncio.to_thread(_send_reply, reply_token, reply_text)
         except Exception as e:
             # Reply token may have expired; log silently
             logger.warning("reply_failed user=%s err=%s", _uid_hash(user_id), str(e))
+            if PUSH_FALLBACK and "Invalid reply token" in str(e):
+                try:
+                    await asyncio.to_thread(_send_push, tenant_id, reply_text)
+                    logger.info("push_fallback_sent user=%s", _uid_hash(user_id))
+                except Exception as push_err:
+                    logger.warning(
+                        "push_fallback_failed user=%s err=%s", _uid_hash(user_id), str(push_err)
+                    )
 
         await _log_activity(pg_pool, tenant_id, user_id, text)
         _log(user_id, model, outcome, t0, len(history))
@@ -477,6 +663,56 @@ def _log(
     )
 
 
+async def _process_message_event(event: MessageEvent, app: FastAPI) -> None:
+    source = event.source
+    tenant_id = (
+        getattr(source, "group_id", None)
+        or getattr(source, "room_id", None)
+        or source.user_id
+    )
+    user_id = getattr(source, "user_id", None) or tenant_id
+    is_group = source.type in ("group", "room")
+    text, mentioned = _strip_self_mentions(event.message)
+    text = text.strip() or event.message.text.strip()
+
+    if not text:
+        return
+
+    await _handle_text(
+        user_id, tenant_id, text, event.reply_token, await _get_pg_pool(app),
+        is_group=is_group, mentioned=mentioned,
+    )
+
+
+async def _process_membership_event(event: JoinEvent | FollowEvent, app: FastAPI) -> None:
+    """Queue a group/room the bot joined, or a user who followed it, for approval."""
+    source = event.source
+    tenant_id = (
+        getattr(source, "group_id", None)
+        or getattr(source, "room_id", None)
+        or source.user_id
+    )
+    pg_pool = await _get_pg_pool(app)
+    status, _ = await _get_tenant_config(pg_pool, tenant_id)
+    if status is not TenantStatus.UNKNOWN:
+        return
+    if await _queue_pending(pg_pool, tenant_id):
+        await _send_pending_notice(event.reply_token, tenant_id)
+
+
+def _event_processor(event):
+    """Return the background handler for an event we act on, else None."""
+    if isinstance(event, MessageEvent):
+        if isinstance(event.message, TextMessageContent):
+            return _process_message_event
+        return None
+    if isinstance(event, JoinEvent) and event.source.type in ("group", "room"):
+        return _process_membership_event
+    if isinstance(event, FollowEvent) and event.source.type == "user":
+        return _process_membership_event
+    return None
+
+
 @app.post("/webhook")
 async def webhook(request: Request):
     body = await request.body()
@@ -489,29 +725,24 @@ async def webhook(request: Request):
     except Exception:
         return JSONResponse(status_code=400, content={"error": "bad request"})
 
+    # Ack immediately: LINE needs a 2xx within 2s or it redelivers the event.
+    # The actual work runs in background tasks; nothing here awaits the network.
     for event in events:
-        if not isinstance(event, MessageEvent):
+        process = _event_processor(event)
+        if process is None:
             continue
-        if not isinstance(event.message, TextMessageContent):
+        if event.mode != EventMode.ACTIVE:
             continue
 
-        source = event.source
-        tenant_id = (
-            getattr(source, "group_id", None)
-            or getattr(source, "room_id", None)
-            or source.user_id
+        redelivery = bool(event.delivery_context and event.delivery_context.is_redelivery)
+        if _is_duplicate_event(event.webhook_event_id):
+            logger.info("event_duplicate id=%s redelivery=%s", event.webhook_event_id, redelivery)
+            continue
+        logger.info(
+            "event_received id=%s redelivery=%s source=%s",
+            event.webhook_event_id, redelivery, event.source.type,
         )
-        user_id = getattr(source, "user_id", None) or tenant_id
-        text = event.message.text.strip()
-
-        if not text:
-            continue
-
-        if _is_rate_limited(user_id):
-            _send_reply(event.reply_token, "Too many requests. Please slow down.")
-            continue
-
-        await _handle_text(user_id, tenant_id, text, event.reply_token, await _get_pg_pool(request.app))
+        _spawn(process(event, request.app))
 
     return {"status": "ok"}
 

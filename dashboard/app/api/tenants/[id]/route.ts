@@ -44,7 +44,14 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
   const { id } = await params
   try {
     const body = await req.json()
-    const { display_name, system_prompt, is_active } = body
+    const { display_name, system_prompt, is_active, reply_mode } = body
+
+    if (reply_mode !== undefined && reply_mode !== 'all' && reply_mode !== 'mention') {
+      return NextResponse.json(
+        { error: "reply_mode must be 'all' or 'mention'" },
+        { status: 400 }
+      )
+    }
 
     const setClauses: string[] = ['updated_at = now()']
     const values: unknown[] = []
@@ -61,6 +68,10 @@ export async function PUT(req: NextRequest, { params }: RouteParams) {
     if (is_active !== undefined) {
       setClauses.push(`is_active = $${idx++}`)
       values.push(is_active)
+    }
+    if (reply_mode !== undefined) {
+      setClauses.push(`reply_mode = $${idx++}`)
+      values.push(reply_mode)
     }
 
     if (setClauses.length === 1) {

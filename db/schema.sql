@@ -6,9 +6,13 @@ CREATE TABLE IF NOT EXISTS tenants (
   display_name  TEXT,
   system_prompt TEXT,
   is_active     BOOLEAN DEFAULT true,
+  reply_mode    TEXT NOT NULL DEFAULT 'mention' CHECK (reply_mode IN ('all', 'mention')),
   created_at    TIMESTAMPTZ DEFAULT now(),
   updated_at    TIMESTAMPTZ DEFAULT now()
 );
+
+-- Idempotent migration: add reply_mode if the table already existed without it
+ALTER TABLE tenants ADD COLUMN IF NOT EXISTS reply_mode TEXT NOT NULL DEFAULT 'mention' CHECK (reply_mode IN ('all', 'mention'));
 
 CREATE TABLE IF NOT EXISTS kb_documents (
   id          UUID PRIMARY KEY DEFAULT gen_random_uuid(),

@@ -52,6 +52,7 @@ type Tenant = {
   display_name: string | null
   system_prompt: string | null
   is_active: boolean
+  reply_mode?: 'all' | 'mention'
   created_at: string
   guardrails?: Guardrails
   metadata?: Record<string, string>
@@ -129,6 +130,7 @@ function PersonaTab({ tenant, onUpdate }: { tenant: Tenant; onUpdate: (t: Tenant
   const [displayName, setDisplayName] = useState(tenant.display_name ?? '')
   const [systemPrompt, setSystemPrompt] = useState(tenant.system_prompt ?? '')
   const [isActive, setIsActive] = useState(tenant.is_active)
+  const [replyMode, setReplyMode] = useState<'all' | 'mention'>(tenant.reply_mode ?? 'mention')
   const [saving, setSaving] = useState(false)
   const [notice, setNotice] = useState<{ type: 'success' | 'error'; msg: string } | null>(null)
 
@@ -143,6 +145,7 @@ function PersonaTab({ tenant, onUpdate }: { tenant: Tenant; onUpdate: (t: Tenant
           display_name: displayName || null,
           system_prompt: systemPrompt || null,
           is_active: isActive,
+          reply_mode: replyMode,
         }),
       })
       const data = await res.json()
@@ -187,6 +190,18 @@ function PersonaTab({ tenant, onUpdate }: { tenant: Tenant; onUpdate: (t: Tenant
           Active (bot responds to messages from this tenant)
         </Label>
       </div>
+      {tenant.type === 'group' && (
+        <div className="flex items-center gap-3">
+          <Switch
+            id="persona-mention-only"
+            checked={replyMode === 'mention'}
+            onCheckedChange={(v) => setReplyMode(v ? 'mention' : 'all')}
+          />
+          <Label htmlFor="persona-mention-only" className="cursor-pointer">
+            Reply only when @mentioned
+          </Label>
+        </div>
+      )}
       <Button onClick={handleSave} disabled={saving}>
         {saving ? 'Saving…' : 'Save Persona'}
       </Button>
