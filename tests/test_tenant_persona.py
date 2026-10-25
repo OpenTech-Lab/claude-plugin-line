@@ -180,3 +180,45 @@ async def test_handle_text_falls_back_to_global_system_prompt(monkeypatch, tmp_p
     await bridge._handle_text("Uabc", "Tabc", "hello", "reply-token", None)
 
     assert captured["messages"][0] == {"role": "system", "content": bridge.SYSTEM_PROMPT}
+
+
+@pytest.mark.asyncio
+async def test_pg_pool_created_later_when_db_unreachable_at_startup(monkeypatch):
+    # Regression: the DB container came up after the bridge, so the startup
+    # attempt failed and pg_pool stayed None for the life of the process.
+    from types import SimpleNamespace
+
+    clock = [1000.0]
+    monkeypatch.setattr(bridge.time, "monotonic", lambda: clock[0])
+    calls = []
+    db_up = [False]
+    pool = _FakePool()
+
+    async def fake_create_pool(*args, **kwargs):
+        calls.append(args)
+        if not db_up[0]:
+            raise ConnectionRefusedError("Connection refused")
+        return pool
+
+    monkeypatch.setattr(bridge.asyncpg, "create_pool", fake_create_pool)
+    app = SimpleNamespace(state=SimpleNamespace(pg_pool=None))
+
+    # Startup: DB down.
+    assert await bridge._get_pg_pool(app) is None
+    assert len(calls) == 1
+
+    # DB comes up, but we are still inside the retry window: no new attempt.
+    db_up[0] = True
+    clock[0] += bridge.PG_RETRY_INTERVAL - 1
+    assert await bridge._get_pg_pool(app) is None
+    assert len(calls) == 1
+
+    # Window elapsed: the pool is created and stored.
+    clock[0] += 1
+    assert await bridge._get_pg_pool(app) is pool
+    assert app.state.pg_pool is pool
+    assert len(calls) == 2
+
+    # Subsequent calls reuse the pool without reconnecting.
+    assert await bridge._get_pg_pool(app) is pool
+    assert len(calls) == 2

@@ -68,6 +68,7 @@ line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
 _rate_store: dict[str, list[float]] = {}
 RATE_LIMIT_WINDOW = 60
 RATE_LIMIT_MAX = 10
+PG_RETRY_INTERVAL = 30  # seconds between postgres reconnect attempts
 
 START_TIME = time.time()
 
@@ -95,16 +96,35 @@ async def _init_db(db: aiosqlite.Connection) -> None:
     await db.commit()
 
 
-@asynccontextmanager
-async def lifespan(app: FastAPI):
-    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
-    async with aiosqlite.connect(DB_PATH) as db:
-        await _init_db(db)
+async def _get_pg_pool(app: FastAPI) -> Optional[asyncpg.Pool]:
+    # The pool is created lazily so a DB that comes up after the bridge (e.g. on
+    # boot) is picked up later. Attempts are throttled to keep a down DB from
+    # adding connect latency to every message.
+    pool = getattr(app.state, "pg_pool", None)
+    if pool is not None:
+        return pool
+    now = time.monotonic()
+    last = getattr(app.state, "pg_pool_last_attempt", None)
+    if last is not None and now - last < PG_RETRY_INTERVAL:
+        return None
+    app.state.pg_pool_last_attempt = now
     try:
         app.state.pg_pool = await asyncpg.create_pool(DATABASE_URL, min_size=1, max_size=5)
     except Exception as e:
         logger.warning("postgres pool unavailable, activity logging disabled: %s", e)
         app.state.pg_pool = None
+        return None
+    logger.info("postgres pool established")
+    return app.state.pg_pool
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    os.makedirs(os.path.dirname(DB_PATH) or ".", exist_ok=True)
+    async with aiosqlite.connect(DB_PATH) as db:
+        await _init_db(db)
+    app.state.pg_pool = None
+    await _get_pg_pool(app)
     yield
     if app.state.pg_pool is not None:
         await app.state.pg_pool.close()
@@ -491,7 +511,7 @@ async def webhook(request: Request):
             _send_reply(event.reply_token, "Too many requests. Please slow down.")
             continue
 
-        await _handle_text(user_id, tenant_id, text, event.reply_token, request.app.state.pg_pool)
+        await _handle_text(user_id, tenant_id, text, event.reply_token, await _get_pg_pool(request.app))
 
     return {"status": "ok"}
 
