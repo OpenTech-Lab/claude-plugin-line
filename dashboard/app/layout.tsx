@@ -33,6 +33,11 @@ function Sidebar() {
     return pathname.startsWith(href)
   }
 
+  async function logout() {
+    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
+    window.location.assign('/login')
+  }
+
   const navLinks = [
     { href: '/', label: 'Overview' },
     { href: '/tenants', label: 'Tenants' },
@@ -72,11 +77,22 @@ function Sidebar() {
           )}
         </Link>
       </nav>
+      <div className="p-2 border-t border-slate-700">
+        <button
+          type="button"
+          onClick={logout}
+          className="w-full text-left px-4 py-2.5 text-sm rounded-md hover:bg-slate-700 transition-colors text-slate-300"
+        >
+          Log out
+        </button>
+      </div>
     </aside>
   )
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
+  // The login page renders bare: no sidebar, and no pending-count polling.
+  const bare = usePathname() === '/login'
   return (
     <html lang="en" className={cn('font-sans', geist.variable)}>
       <head>
@@ -84,8 +100,8 @@ export default function RootLayout({ children }: { children: React.ReactNode }) 
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </head>
       <body>
-        <Sidebar />
-        <main className="ml-56 min-h-screen bg-slate-50">{children}</main>
+        {!bare && <Sidebar />}
+        <main className={cn('min-h-screen bg-slate-50', !bare && 'ml-56')}>{children}</main>
       </body>
     </html>
   )

@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""lbadmin: command-line client for the LINE Bot Admin dashboard API.
+
+Configuration (environment):
+  LINE_ADMIN_URL    base URL of the dashboard (default http://localhost:3001)
+  LINE_ADMIN_TOKEN  the dashboard's ADMIN_API_TOKEN, sent as a Bearer token
+
+Responses are printed as pretty JSON. A non-2xx response prints the error
+body to stderr and exits 1.
+"""
+
+import argparse
+import json
+import mimetypes
+import os
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+DEFAULT_URL = "http://localhost:3001"
+
+
+class CliError(Exception):
+    """A user-facing failure: message goes to stderr, exit status 1."""
+
+
+def q(value):
+    """Encode one path segment, including '/'."""
+    return urllib.parse.quote(value, safe="")
+
+
+def base_url():
+    return os.environ.get("LINE_ADMIN_URL", DEFAULT_URL).rstrip("/")
+
+
+def token():
+    value = os.environ.get("LINE_ADMIN_TOKEN", "")
+    if not value:
+        raise CliError("LINE_ADMIN_TOKEN is not set; export it with the dashboard's ADMIN_API_TOKEN")
+    return value
+
+
+def build_request(method, path, body=None, data=None, content_type=None):
+    """Build the urllib Request for one API call. `body` is sent as JSON."""
+    headers = {"Authorization": f"Bearer {token()}", "Accept": "application/json"}
+    if body is not None:
+        data = json.dumps(body).encode("utf-8")
+        content_type = "application/json"
+    if content_type:
+        headers["Content-Type"] = content_type
+    return urllib.request.Request(base_url() + path, data=data, headers=headers, method=method)
+
+
+def call(method, path, body=None, data=None, content_type=None):
+    req = build_request(method, path, body=body, data=data, content_type=content_type)
+    try:
+        with urllib.request.urlopen(req) as res:
+            raw = res.read()
+    except urllib.error.HTTPError as err:
+        raw = err.read().decode("utf-8", "replace")
+        try:
+            detail = json.dumps(json.loads(raw), indent=2, ensure_ascii=False)
+        except ValueError:
+            detail = json.dumps({"status": err.code, "body": raw}, indent=2, ensure_ascii=False)
+        raise CliError(f"HTTP {err.code} {method} {path}\n{detail}") from None
+    except urllib.error.URLError as err:
+        raise CliError(f"cannot reach {base_url()}: {err.reason}") from None
+    return json.loads(raw) if raw else None
+
+
+def multipart(fields, file_field, file_path):
+    """Encode form fields plus one file as multipart/form-data."""
+    boundary = uuid.uuid4().hex
+    name = os.path.basename(file_path).replace('"', "%22").replace("\r", "").replace("\n", "")
+    ctype = mimetypes.guess_type(file_path)[0] or "application/octet-stream"
+    with open(file_path, "rb") as fh:
+        content = fh.read()
+    parts = []
+    for key, value in fields.items():
+        parts.append(
+            f'--{boundary}\r\nContent-Disposition: form-data; name="{key}"\r\n\r\n{value}\r\n'.encode()
+        )
+    parts.append(
+        f'--{boundary}\r\nContent-Disposition: form-data; name="{file_field}"; filename="{name}"\r\n'
+        f"Content-Type: {ctype}\r\n\r\n".encode()
+        + content
+        + b"\r\n"
+    )
+    parts.append(f"--{boundary}--\r\n".encode())
+    return b"".join(parts), f"multipart/form-data; boundary={boundary}"
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+    except OSError as err:
+        raise CliError(f"cannot read {path}: {err.strerror}") from None
+
+
+def parse_json_object(text):
+    try:
+        value = json.loads(text)
+    except ValueError as err:
+        raise CliError(f"--json is not valid JSON: {err}") from None
+    if not isinstance(value, dict):
+        raise CliError("--json must be a JSON object")
+    return value
+
+
+def require_yes(args, what):
+    if not args.yes:
+        raise CliError(f"refusing to delete {what} without --yes")
+
+
+def tenant_path(tenant_id, *rest):
+    return "/api/tenants/" + "/".join([q(tenant_id), *rest])
+
+
+# --- command handlers: each returns the JSON to print -------------------------
+
+def tenants_list(args):
+    return call("GET", "/api/tenants")
+
+
+def tenants_show(args):
+    return call("GET", tenant_path(args.id))
+
+
+def tenants_create(args):
+    body = {"id": args.id, "type": args.type}
+    if args.name is not None:
+        body["display_name"] = args.name
+    return call("POST", "/api/tenants", body)
+
+
+def tenants_delete(args):
+    require_yes(args, f"tenant {args.id}")
+    return call("DELETE", tenant_path(args.id))
+
+
+def tenant_set(args):
+    body = {}
+    if args.name is not None:
+        body["display_name"] = args.name
+    if args.prompt is not None:
+        body["system_prompt"] = args.prompt
+    if args.prompt_file is not None:
+        body["system_prompt"] = read_text(args.prompt_file)
+    if args.active is not None:
+        body["is_active"] = args.active == "true"
+    if args.reply_mode is not None:
+        body["reply_mode"] = args.reply_mode
+    if not body:
+        raise CliError("nothing to update: pass --name, --prompt/--prompt-file, --active or --reply-mode")
+    return call("PUT", tenant_path(args.id), body)
+
+
+def kb_list(args):
+    return call("GET", tenant_path(args.id, "documents"))
+
+
+def kb_show(args):
+    return call("GET", tenant_path(args.id, "documents", q(args.doc)))
+
+
+def kb_add_text(args):
+    content = args.content if args.content is not None else read_text(args.file)
+    return call("POST", tenant_path(args.id, "documents"), {"title": args.title, "content": content})
+
+
+def kb_add_url(args):
+    body = {"source_type": "website", "url": args.url}
+    if args.title is not None:
+        body["title"] = args.title
+    return call("POST", tenant_path(args.id, "documents"), body)
+
+
+def kb_upload(args):
+    if not os.path.isfile(args.file):
+        raise CliError(f"no such file: {args.file}")
+    fields = {"title": args.title} if args.title is not None else {}
+    data, ctype = multipart(fields, "file", args.file)
+    return call("POST", tenant_path(args.id, "documents"), data=data, content_type=ctype)
+
+
+def kb_edit(args):
+    body = {}
+    if args.title is not None:
+        body["title"] = args.title
+    if args.content is not None:
+        body["content"] = args.content
+    if args.file is not None:
+        body["content"] = read_text(args.file)
+    if not body:
+        raise CliError("nothing to update: pass --title and/or --content/--file")
+    return call("PUT", tenant_path(args.id, "documents", q(args.doc)), body)
+
+
+def kb_delete(args):
+    require_yes(args, f"document {args.doc}")
+    return call("DELETE", tenant_path(args.id, "documents", q(args.doc)))
+
+
+def guardrails_show(args):
+    return call("GET", tenant_path(args.id, "guardrails"))
+
+
+def guardrails_set(args):
+    return call("PUT", tenant_path(args.id, "guardrails"), parse_json_object(args.json))
+
+
+def metadata_show(args):
+    return call("GET", tenant_path(args.id, "metadata"))
+
+
+def metadata_set(args):
+    return call("PUT", tenant_path(args.id, "metadata"), parse_json_object(args.json))
+
+
+def pending_list(args):
+    return call("GET", "/api/pending")
+
+
+def pending_approve(args):
+    return call("POST", f"/api/pending/{q(args.id)}/approve")
+
+
+def pending_deny(args):
+    return call("POST", f"/api/pending/{q(args.id)}/deny")
+
+
+def activity(args):
+    path = "/api/activity"
+    if args.tenant:
+        path += "?" + urllib.parse.urlencode({"tenant_id": args.tenant})
+    rows = call("GET", path)
+    if args.limit is not None and isinstance(rows, list):
+        rows = rows[: args.limit]
+    return rows
+
+
+# --- argument parsing ----------------------------------------------------------
+
+def positive_int(text):
+    value = int(text)
+    if value < 1:
+        raise argparse.ArgumentTypeError("must be >= 1")
+    return value
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(
+        prog="lbadmin",
+        description=__doc__,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    groups = parser.add_subparsers(dest="group", required=True, metavar="COMMAND")
+
+    def sub(subparsers, name, handler, help_text):
+        p = subparsers.add_parser(name, help=help_text, description=help_text)
+        p.set_defaults(handler=handler)
+        return p
+
+    # tenants
+    tenants = groups.add_parser("tenants", help="list, show, create or delete tenants")
+    ts = tenants.add_subparsers(dest="action", required=True, metavar="ACTION")
+    sub(ts, "list", tenants_list, "list all tenants")
+    sub(ts, "show", tenants_show, "show a tenant with its guardrails and metadata").add_argument("id")
+    p = sub(ts, "create", tenants_create, "create a tenant")
+    p.add_argument("id")
+    p.add_argument("--type", required=True, choices=["group", "user"])
+    p.add_argument("--name", help="display name")
+    p = sub(ts, "delete", tenants_delete, "delete a tenant")
+    p.add_argument("id")
+    p.add_argument("--yes", action="store_true", help="confirm the deletion")
+
+    # tenant set
+    tenant = groups.add_parser("tenant", help="update a tenant's settings")
+    tns = tenant.add_subparsers(dest="action", required=True, metavar="ACTION")
+    p = sub(tns, "set", tenant_set, "update a tenant's name, prompt, active flag or reply mode")
+    p.add_argument("id")
+    p.add_argument("--name", help="display name")
+    prompt = p.add_mutually_exclusive_group()
+    prompt.add_argument("--prompt", help="system prompt text")
+    prompt.add_argument("--prompt-file", metavar="FILE", help="read the system prompt from FILE")
+    p.add_argument("--active", choices=["true", "false"])
+    p.add_argument("--reply-mode", choices=["all", "mention"])
+
+    # kb
+    kb = groups.add_parser("kb", help="manage a tenant's knowledge-base documents")
+    ks = kb.add_subparsers(dest="action", required=True, metavar="ACTION")
+    sub(ks, "list", kb_list, "list a tenant's documents").add_argument("id")
+    p = sub(ks, "show", kb_show, "show one document with its content")
+    p.add_argument("id")
+    p.add_argument("doc")
+    p = sub(ks, "add-text", kb_add_text, "add a text document")
+    p.add_argument("id")
+    p.add_argument("--title", required=True)
+    src = p.add_mutually_exclusive_group(required=True)
+    src.add_argument("--content", help="document text")
+    src.add_argument("--file", metavar="FILE", help="read the document text from FILE")
+    p = sub(ks, "add-url", kb_add_url, "add a document fetched from a web page")
+    p.add_argument("id")
+    p.add_argument("url")
+    p.add_argument("--title", help="defaults to the page's <title>")
+    p = sub(ks, "upload", kb_upload, "upload a PDF, TXT or MD file")
+    p.add_argument("id")
+    p.add_argument("file")
+    p.add_argument("--title", help="defaults to the file name")
+    p = sub(ks, "edit", kb_edit, "change a document's title and/or content")
+    p.add_argument("id")
+    p.add_argument("doc")
+    p.add_argument("--title")
+    src = p.add_mutually_exclusive_group()
+    src.add_argument("--content", help="new document text")
+    src.add_argument("--file", metavar="FILE", help="read the new text from FILE")
+    p = sub(ks, "delete", kb_delete, "delete a document")
+    p.add_argument("id")
+    p.add_argument("doc")
+    p.add_argument("--yes", action="store_true", help="confirm the deletion")
+
+    # guardrails / metadata
+    for name, show, setter, set_help in (
+        ("guardrails", guardrails_show, guardrails_set,
+         "replace a tenant's guardrails (fields left out are cleared)"),
+        ("metadata", metadata_show, metadata_set,
+         "replace a tenant's metadata (keys left out are deleted)"),
+    ):
+        g = groups.add_parser(name, help=f"show or replace a tenant's {name}")
+        gs = g.add_subparsers(dest="action", required=True, metavar="ACTION")
+        sub(gs, "show", show, f"show a tenant's {name}").add_argument("id")
+        p = sub(gs, "set", setter, set_help)
+        p.add_argument("id")
+        p.add_argument("--json", required=True, metavar="OBJECT", help="a JSON object")
+
+    # pending
+    pending = groups.add_parser("pending", help="review groups/users waiting for approval")
+    ps = pending.add_subparsers(dest="action", required=True, metavar="ACTION")
+    sub(ps, "list", pending_list, "list pending approvals")
+    sub(ps, "approve", pending_approve, "approve a pending group or user").add_argument("id")
+    sub(ps, "deny", pending_deny, "deny a pending group or user").add_argument("id")
+
+    # activity
+    p = groups.add_parser(
+        "activity",
+        help="show recent activity",
+        description="Show recent activity. The server returns at most 50 rows; "
+        "--limit trims that list client-side.",
+    )
+    p.set_defaults(handler=activity)
+    p.add_argument("--tenant", metavar="ID", help="only this tenant")
+    p.add_argument("--limit", type=positive_int, metavar="N", help="show at most N rows")
+
+    return parser
+
+
+def main(argv=None):
+    args = build_parser().parse_args(argv)
+    try:
+        result = args.handler(args)
+    except CliError as err:
+        print(f"lbadmin: {err}", file=sys.stderr)
+        return 1
+    print(json.dumps(result, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
