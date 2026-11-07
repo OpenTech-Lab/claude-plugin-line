@@ -241,6 +241,13 @@ or anyone else's 1:1) is `SHARED`. If `CLAUDE_OWNER_USER_ID` is unset, every
 chat is `SHARED`. `CLAUDE_ALLOWED_USERS` still decides who may trigger claude
 at all; an empty list allows everyone.
 
+**Operator groups.** A group or room listed in `CLAUDE_OPERATOR_CHATS` gives
+the owner's own messages the full `OWNER` setup there too (tools, MCP, memory,
+files), and the prompt notes that other people read the reply. Anything those
+tools return can appear in the group, so list only groups whose members may
+see it. Other members' messages stay `SHARED`, and they still can't trigger
+claude unless they are in `CLAUDE_ALLOWED_USERS`.
+
 | | `OWNER` | `SHARED` |
 |---|---|---|
 | Tools, MCP servers, skills, hooks, CLAUDE.md | Your normal setup | None |
@@ -282,8 +289,8 @@ a profile appeared, the reply is thrown away. Each shared run logs the resolved
 `claude` binary, so auto-updates show up in the logs.
 
 **Contract for other channels.** A channel that runs `claude` for a chat
-should resolve an audience the same way (`OWNER` only for the owner's own 1:1,
-`SHARED` otherwise, `SHARED` when unsure) and pass it explicitly. In this
+should resolve an audience the same way (`OWNER` only for the owner's own 1:1
+or an explicitly listed operator group, `SHARED` otherwise, `SHARED` when unsure) and pass it explicitly. In this
 bridge, `_call_claude_code(..., audience=..., tenant_id=...)` has no default
 for either, so no caller can fall into `OWNER` by omission, and a `SHARED` run
 takes its argv, cwd and environment from `_shared_launch()`.
@@ -389,6 +396,7 @@ The pm2 bridge in Claude mode (`CLAUDE_MODE=true`) also reads:
 | `CLAUDE_REPLY_WINDOW_S` | `45` | A run still going after this gets a free "working on it" reply, and its answer is sent by push (counts toward the monthly message quota). LINE guarantees reply tokens for one minute only |
 | `CLAUDE_ALLOWED_USERS` | — | Comma-separated LINE userIds allowed to trigger claude. Empty allows everyone |
 | `CLAUDE_OWNER_USER_ID` | — | Your LINE userId. Only your own 1:1 chat gets the full setup; unset makes every chat shared. See [Shared chats](#shared-chats-pm2-bridge-claude-mode) |
+| `CLAUDE_OPERATOR_CHATS` | — | Comma-separated group/room ids where your own messages also get the full setup. Other members read those replies |
 | `CLAUDE_SHARED_OAUTH_TOKEN` | — | Token from `claude setup-token`, used only for shared chats. Unset means shared chats get `SHARED_UNAVAILABLE_MESSAGE` |
 | `CLAUDE_SHARED_DIR` | `~/.local/state/line-claude-bridge/shared` | Empty home and config directory for shared runs; keep it outside any repo |
 | `SHARED_UNAVAILABLE_MESSAGE` | `The assistant is not available in this chat right now.` | Reply sent when a shared run is refused |

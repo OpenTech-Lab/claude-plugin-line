@@ -83,6 +83,18 @@ CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip(
 # The one LINE userId whose own 1:1 chat gets the full local claude (tools,
 # MCP, memory). Every other chat is SHARED; unset means every chat is SHARED.
 CLAUDE_OWNER_USER_ID = os.getenv("CLAUDE_OWNER_USER_ID", "").strip()
+# Group/room ids where the owner's messages also get the full local claude.
+# Other members read those replies, so list only groups whose members may
+# see anything the owner's tools return. Other members still can't trigger
+# claude unless they are in CLAUDE_ALLOWED_USERS.
+# Example: CLAUDE_OPERATOR_CHATS=Cabc123,Rdef456
+_raw_ops = os.getenv("CLAUDE_OPERATOR_CHATS", "")
+CLAUDE_OPERATOR_CHATS: set[str] = {c.strip() for c in _raw_ops.split(",") if c.strip()}
+OPERATOR_GROUP_NOTE = (
+    "[This reply is posted in a LINE group that other people read. "
+    "Include private details (emails, credentials, unrelated projects) "
+    "only when the request needs them.]"
+)
 # Token from `claude setup-token` for SHARED runs. Never name it
 # CLAUDE_CODE_OAUTH_TOKEN in the bridge's environment: the owner's run
 # inherits that environment and would switch to this login.
@@ -595,7 +607,8 @@ def _format_history(history: list[dict]) -> str:
 
 # ---------- Audience policy ----------
 # Who reads a reply decides what the run may draw on. Only the owner's own
-# 1:1 chat gets the full local claude (tools, MCP, memory, the owner's login).
+# 1:1 chat, and the owner's messages in a CLAUDE_OPERATOR_CHATS group, get
+# the full local claude (tools, MCP, memory, the owner's login).
 # Every other chat — a group, a room, anyone else's 1:1 — is SHARED: an
 # answer-only claude that sees that chat's history and that tenant's KB and
 # nothing else. This is enforced by how claude is launched, not by prompt text.
@@ -608,12 +621,11 @@ class Audience(Enum):
 
 def _resolve_audience(user_id: str, tenant_id: str, is_group: bool) -> Audience:
     # Fails closed: an unset owner id makes every chat SHARED.
-    if (
-        CLAUDE_OWNER_USER_ID
-        and not is_group
-        and user_id == CLAUDE_OWNER_USER_ID
-        and tenant_id == CLAUDE_OWNER_USER_ID
-    ):
+    if not CLAUDE_OWNER_USER_ID or user_id != CLAUDE_OWNER_USER_ID:
+        return Audience.SHARED
+    if not is_group and tenant_id == CLAUDE_OWNER_USER_ID:
+        return Audience.OWNER
+    if is_group and tenant_id in CLAUDE_OPERATOR_CHATS:
         return Audience.OWNER
     return Audience.SHARED
 
@@ -711,6 +723,8 @@ async def _call_claude_code(
     if system_prompt:
         parts.append(system_prompt)
     if audience is Audience.OWNER:
+        if tenant_id != user_id:
+            parts.append(OPERATOR_GROUP_NOTE)
         memory_ctx = ""
         if MEMORY_ENABLED:
             memory_ctx = await _fetch_memory(text)

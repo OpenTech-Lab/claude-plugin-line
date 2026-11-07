@@ -23,6 +23,7 @@ def _reset_rate_store(monkeypatch, tmp_path):
     # supply a token, or point shared runs at the real state directory.
     monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", "")
     monkeypatch.setattr(bridge, "CLAUDE_SHARED_OAUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "CLAUDE_OPERATOR_CHATS", set())
     monkeypatch.setattr(bridge, "CLAUDE_SHARED_DIR", str(tmp_path / "shared"))
     monkeypatch.setattr(bridge, "_tenant_config_cache", {})
     monkeypatch.setattr(bridge, "_kb_nonce", lambda: TEST_NONCE)
@@ -1133,6 +1134,25 @@ def test_resolve_audience_only_owner_dm_is_owner(monkeypatch, owner, user_id, te
     assert bridge._resolve_audience(user_id, tenant_id, is_group) is expected
 
 
+@pytest.mark.parametrize(
+    "owner, user_id, tenant_id, is_group, expected",
+    [
+        (OWNER_ID, OWNER_ID, "Cops", True, OWNER),
+        (OWNER_ID, OWNER_ID, "Rops", True, OWNER),
+        (OWNER_ID, OWNER_ID, "Cgroup", True, SHARED),
+        (OWNER_ID, "Uother", "Cops", True, SHARED),
+        (OWNER_ID, OWNER_ID, "Cops", False, SHARED),
+        ("", OWNER_ID, "Cops", True, SHARED),
+    ],
+    ids=["owner-in-operator-group", "owner-in-operator-room", "owner-in-other-group",
+         "other-user-in-operator-group", "operator-id-not-a-group", "owner-unset"],
+)
+def test_resolve_audience_operator_chats(monkeypatch, owner, user_id, tenant_id, is_group, expected):
+    monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", owner)
+    monkeypatch.setattr(bridge, "CLAUDE_OPERATOR_CHATS", {"Cops", "Rops"})
+    assert bridge._resolve_audience(user_id, tenant_id, is_group) is expected
+
+
 @pytest.fixture
 def spawns(monkeypatch):
     """Capture create_subprocess_exec calls; returns (calls, procs) to inspect."""
@@ -1228,6 +1248,19 @@ async def test_owner_run_is_unchanged(spawns, monkeypatch):
     assert kwargs["cwd"] == bridge.CLAUDE_CWD
     assert "env" not in kwargs  # inherits the bridge's environment, as before
     assert procs[0].received_input.decode() == "Persona.\n\nhi"
+
+
+@pytest.mark.asyncio
+async def test_owner_run_in_operator_group_is_told_others_read_it(spawns, monkeypatch):
+    calls, procs = spawns
+    monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
+
+    await bridge._call_claude_code("Uabc", "hi", "Persona.", audience=OWNER, tenant_id="Cops")
+
+    (args, kwargs), = calls
+    assert list(args) == ["claude", "--print", "--output-format", "text"]
+    assert "env" not in kwargs
+    assert procs[0].received_input.decode() == f"Persona.\n\n{bridge.OPERATOR_GROUP_NOTE}\n\nhi"
 
 
 @pytest.mark.parametrize(
