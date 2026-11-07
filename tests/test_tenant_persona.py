@@ -8,6 +8,8 @@ import line_claude_bridge as bridge
 APPROVED = bridge.TenantStatus.APPROVED
 UNKNOWN = bridge.TenantStatus.UNKNOWN
 UNAVAILABLE = bridge.TenantStatus.UNAVAILABLE
+OWNER = bridge.Audience.OWNER
+SHARED = bridge.Audience.SHARED
 TEST_NONCE = "n0nce"
 _REAL_KB_NONCE = bridge._kb_nonce
 KB_HEADER = bridge.KB_CONTEXT_HEADER.format(nonce=TEST_NONCE)
@@ -15,8 +17,13 @@ KB_FOOTER = bridge.KB_CONTEXT_FOOTER.format(nonce=TEST_NONCE)
 
 
 @pytest.fixture(autouse=True)
-def _reset_rate_store(monkeypatch):
+def _reset_rate_store(monkeypatch, tmp_path):
     monkeypatch.setattr(bridge, "_rate_store", {})
+    # load_dotenv() ran at import; never let the real .env pick the audience,
+    # supply a token, or point shared runs at the real state directory.
+    monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", "")
+    monkeypatch.setattr(bridge, "CLAUDE_SHARED_OAUTH_TOKEN", "")
+    monkeypatch.setattr(bridge, "CLAUDE_SHARED_DIR", str(tmp_path / "shared"))
     monkeypatch.setattr(bridge, "_tenant_config_cache", {})
     monkeypatch.setattr(bridge, "_kb_nonce", lambda: TEST_NONCE)
 
@@ -208,7 +215,9 @@ async def test_call_claude_code_includes_custom_system_prompt(monkeypatch):
     monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", set())
     monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
 
-    result = await bridge._call_claude_code("Uabc", "hi", "You are a pirate.")
+    result = await bridge._call_claude_code(
+        "Uabc", "hi", "You are a pirate.", audience=OWNER, tenant_id="Uabc"
+    )
 
     assert result == "hello back"
     sent_prompt = fake_proc.received_input.decode()
@@ -227,7 +236,7 @@ async def test_call_claude_code_omits_empty_system_prompt(monkeypatch):
     monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", set())
     monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
 
-    await bridge._call_claude_code("Uabc", "hi", "")
+    await bridge._call_claude_code("Uabc", "hi", "", audience=OWNER, tenant_id="Uabc")
 
     assert fake_proc.received_input.decode() == "hi"
 
@@ -717,12 +726,13 @@ async def test_bot_reply_uses_tenant_knowledge_base(chat_env):
 
 
 @pytest.mark.asyncio
-async def test_claude_mode_leaves_out_knowledge_base_and_passes_history(chat_env, monkeypatch):
+async def test_claude_mode_owner_dm_leaves_out_knowledge_base_and_passes_history(chat_env, monkeypatch):
     await _init_chat_db()
     monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
+    monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", "Uabc")
     calls = []
 
-    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None, **kwargs):
         calls.append((system_prompt, history))
         return "claude reply"
 
@@ -746,7 +756,7 @@ async def test_claude_mode_history_is_per_chat(chat_env, monkeypatch):
     monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
     calls = []
 
-    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None, **kwargs):
         calls.append(history)
         return f"re: {text}"
 
@@ -827,7 +837,10 @@ async def test_call_claude_code_includes_history(monkeypatch):
     monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", set())
     monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
 
-    await bridge._call_claude_code("Uabc", "is it done?", "", [{"role": "user", "content": "release"}])
+    await bridge._call_claude_code(
+        "Uabc", "is it done?", "", [{"role": "user", "content": "release"}],
+        audience=OWNER, tenant_id="Uabc",
+    )
 
     sent = fake_proc.received_input.decode()
     assert "User: release" in sent
@@ -866,6 +879,44 @@ async def test_commands_do_not_query_knowledge_base(chat_env, command):
 
     assert db.kb_queries == 0
     assert len(sent) == 1 and llm_calls == []
+
+
+# ---------- per-chat /clear and /status ----------
+
+async def _seed_turns(rows):
+    async with bridge.aiosqlite.connect(bridge.DB_PATH) as db:
+        for chat_id, text in rows:
+            await bridge._save_turn(db, "Uabc", chat_id, text, f"re: {text}")
+
+
+@pytest.mark.asyncio
+async def test_clear_in_group_keeps_the_users_other_chats(chat_env):
+    _, sent, _ = chat_env
+    await _init_chat_db()
+    await _seed_turns([("Uabc", "private"), ("Cgroup", "group talk")])
+
+    await bridge._handle_text("Uabc", "Cgroup", "/clear", "tok", _FakeDB(), is_group=True, mentioned=True)
+
+    assert sent == [("tok", "History cleared.")]
+    async with bridge.aiosqlite.connect(bridge.DB_PATH) as db:
+        assert await bridge._get_history(db, "Uabc", "Cgroup") == []
+        assert await bridge._get_history(db, "Uabc", "Uabc") == [
+            {"role": "user", "content": "private"},
+            {"role": "assistant", "content": "re: private"},
+        ]
+
+
+@pytest.mark.asyncio
+async def test_status_in_group_counts_only_that_chats_rows(chat_env):
+    _, sent, _ = chat_env
+    await _init_chat_db()
+    await _seed_turns([("Uabc", "a"), ("Uabc", "b"), ("Cgroup", "c")])
+
+    await bridge._handle_text("Uabc", "Cgroup", "/status", "tok", _FakeDB(), is_group=True, mentioned=True)
+    await bridge._handle_text("Uabc", "Uabc", "/status", "tok2", _FakeDB())
+
+    assert "History rows: 2\n" in sent[0][1]
+    assert "History rows: 4\n" in sent[1][1]
 
 
 @pytest.mark.asyncio
@@ -920,7 +971,7 @@ async def test_call_claude_code_timeout_stops_whole_process_group(monkeypatch, t
 
     t0 = bridge.time.monotonic()
     with pytest.raises(bridge.ClaudeCodeTimeout):
-        await bridge._call_claude_code("Uabc", "hi", "")
+        await bridge._call_claude_code("Uabc", "hi", "", audience=OWNER, tenant_id="Uabc")
     # A survivor holding the pipes would block the handler until sleep ends.
     assert bridge.time.monotonic() - t0 < 5
 
@@ -944,7 +995,7 @@ async def test_claude_mode_timeout_replies_logs_timeout_and_skips_history(chat_e
     monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
     histories = []
 
-    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None, **kwargs):
         histories.append(history)
         if text == "slow":
             raise bridge.ClaudeCodeTimeout
@@ -975,7 +1026,7 @@ def claude_window_env(chat_env, monkeypatch):
 
 
 def _fake_claude(monkeypatch, delay, result=None, exc=None):
-    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None, **kwargs):
         await bridge.asyncio.sleep(delay)
         if exc:
             raise exc
@@ -1036,7 +1087,7 @@ async def test_cancelling_handler_cancels_claude_run(claude_window_env, monkeypa
     await _init_chat_db()
     cancelled = bridge.asyncio.Event()
 
-    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None, **kwargs):
         try:
             await bridge.asyncio.sleep(30)
         except bridge.asyncio.CancelledError:
@@ -1050,3 +1101,255 @@ async def test_cancelling_handler_cancels_claude_run(claude_window_env, monkeypa
     with pytest.raises(bridge.asyncio.CancelledError):
         await handler
     await bridge.asyncio.wait_for(cancelled.wait(), timeout=1)
+
+
+# ---------- audience policy: owner 1:1 vs shared chats ----------
+
+OWNER_ID = "U3f9c1d27b85e4a60f1c2d3e4b5a69788"
+FAKE_CLAUDE = "/opt/fake-bin/claude"
+FAKE_TOKEN = "sk-ant-oat01-dummy-shared-token"
+
+
+@pytest.mark.parametrize(
+    "owner, user_id, tenant_id, is_group, expected",
+    [
+        (OWNER_ID, OWNER_ID, OWNER_ID, False, OWNER),
+        (OWNER_ID, OWNER_ID, "Cgroup", True, SHARED),
+        (OWNER_ID, OWNER_ID, "Rroom", True, SHARED),
+        (OWNER_ID, "Uother", "Uother", False, SHARED),
+        (OWNER_ID, OWNER_ID, OWNER_ID, True, SHARED),
+        (OWNER_ID, "Uother", OWNER_ID, False, SHARED),
+        (OWNER_ID, OWNER_ID, "Uother", False, SHARED),
+        ("", OWNER_ID, OWNER_ID, False, SHARED),
+        ("", "", "", False, SHARED),
+    ],
+    ids=[
+        "owner-dm", "owner-in-group", "owner-in-room", "other-dm",
+        "group-flag-wins", "other-user-in-owner-chat", "owner-in-other-chat", "owner-unset", "owner-unset-empty-ids",
+    ],
+)
+def test_resolve_audience_only_owner_dm_is_owner(monkeypatch, owner, user_id, tenant_id, is_group, expected):
+    monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", owner)
+    assert bridge._resolve_audience(user_id, tenant_id, is_group) is expected
+
+
+@pytest.fixture
+def spawns(monkeypatch):
+    """Capture create_subprocess_exec calls; returns (calls, procs) to inspect."""
+    calls, procs = [], []
+
+    async def fake_exec(*args, **kwargs):
+        calls.append((args, kwargs))
+        proc = _FakeProc(stdout=b"claude answer")
+        procs.append(proc)
+        return proc
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", set())
+    monkeypatch.setattr(bridge, "CLAUDE_CODE_MODEL", "")
+    monkeypatch.setattr(bridge.shutil, "which", lambda name: FAKE_CLAUDE if name == "claude" else None)
+    return calls, procs
+
+
+@pytest.fixture
+def shared_env(spawns, monkeypatch, tmp_path):
+    """A configured shared login with the bridge's own secrets planted in os.environ."""
+    monkeypatch.setattr(bridge, "CLAUDE_SHARED_OAUTH_TOKEN", FAKE_TOKEN)
+    monkeypatch.setattr(bridge, "CLAUDE_SHARED_DIR", str(tmp_path / "shared"))
+    for key in ("LINE_CHANNEL_ACCESS_TOKEN", "CLAUDECODE", "SSH_AUTH_SOCK", "CLAUDE_CODE_USER_EMAIL"):
+        monkeypatch.setenv(key, f"planted-{key}")
+    return spawns, tmp_path / "shared"
+
+
+def _expected_shared_argv(*extra):
+    return [
+        FAKE_CLAUDE, "--print", "--output-format", "text",
+        "--no-session-persistence", "--restricted",
+        "--permission-prompts", "none",
+        "--setting-sources", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--tools", "",
+        "--disable-slash-commands",
+        "--system-prompt", bridge.SHARED_SYSTEM_PROMPT,
+        *extra,
+    ]
+
+
+@pytest.mark.parametrize("model, extra", [("", ()), ("claude-haiku-x", ("--model", "claude-haiku-x"))])
+@pytest.mark.asyncio
+async def test_shared_run_uses_isolated_argv_cwd_and_fresh_env(shared_env, monkeypatch, model, extra):
+    (calls, _), shared = shared_env
+    monkeypatch.setattr(bridge, "CLAUDE_CODE_MODEL", model)
+
+    result = await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+
+    assert result == "claude answer"
+    (args, kwargs), = calls
+    assert list(args) == _expected_shared_argv(*extra)
+    assert kwargs["cwd"] == str(shared / "home")
+    assert kwargs["start_new_session"] is True
+    assert kwargs["env"] == {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": str(shared / "home"),
+        "LANG": "C.UTF-8",
+        "CLAUDE_CONFIG_DIR": str(shared / "config"),
+        "CLAUDE_CODE_OAUTH_TOKEN": FAKE_TOKEN,
+        "CLAUDE_CODE_DISABLE_ATTACHMENTS": "1",
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+        "DISABLE_AUTOUPDATER": "1",
+    }
+    for planted in ("LINE_CHANNEL_ACCESS_TOKEN", "CLAUDECODE", "SSH_AUTH_SOCK", "CLAUDE_CODE_USER_EMAIL"):
+        assert planted not in kwargs["env"]
+        assert f"planted-{planted}" not in kwargs["env"].values()
+    for d in (shared, shared / "home", shared / "config"):
+        assert d.stat().st_mode & 0o777 == 0o700
+
+
+@pytest.mark.asyncio
+async def test_shared_run_logs_resolved_claude_binary(shared_env, caplog):
+    caplog.set_level("INFO")
+    await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+    assert f"shared run claude={bridge.os.path.realpath(FAKE_CLAUDE)}" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_owner_run_is_unchanged(spawns, monkeypatch):
+    calls, procs = spawns
+    monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
+    monkeypatch.setenv("SSH_AUTH_SOCK", "planted")
+
+    result = await bridge._call_claude_code("Uabc", "hi", "Persona.", audience=OWNER, tenant_id="Uabc")
+
+    assert result == "claude answer"
+    (args, kwargs), = calls
+    assert list(args) == ["claude", "--print", "--output-format", "text"]
+    assert kwargs["cwd"] == bridge.CLAUDE_CWD
+    assert "env" not in kwargs  # inherits the bridge's environment, as before
+    assert procs[0].received_input.decode() == "Persona.\n\nhi"
+
+
+@pytest.mark.parametrize(
+    "token, config_text",
+    [
+        ("", None),
+        (FAKE_TOKEN, '{"numStartups": 1, "oauthAccount": {"emailAddress": "x@example.invalid"}}'),
+        (FAKE_TOKEN, "{not json"),
+        (FAKE_TOKEN, "[]"),
+    ],
+    ids=["no-token", "account-profile", "invalid-json", "not-an-object"],
+)
+@pytest.mark.asyncio
+async def test_shared_run_refused_without_spawning(shared_env, monkeypatch, token, config_text):
+    (calls, _), shared = shared_env
+    monkeypatch.setattr(bridge, "CLAUDE_SHARED_OAUTH_TOKEN", token)
+    if config_text is not None:
+        (shared / "config").mkdir(parents=True)
+        (shared / "config" / ".claude.json").write_text(config_text)
+
+    result = await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+
+    assert result == bridge.SHARED_UNAVAILABLE_MESSAGE
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_shared_run_refused_when_claude_not_on_path(shared_env, monkeypatch):
+    (calls, _), _ = shared_env
+    monkeypatch.setattr(bridge.shutil, "which", lambda name: None)
+    result = await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+    assert result == bridge.SHARED_UNAVAILABLE_MESSAGE
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_shared_run_with_clean_existing_config_runs(shared_env):
+    (calls, _), shared = shared_env
+    (shared / "config").mkdir(parents=True)
+    (shared / "config" / ".claude.json").write_text('{"numStartups": 3}')
+
+    result = await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+
+    assert result == "claude answer" and len(calls) == 1
+
+
+@pytest.mark.parametrize("returncode", [0, 1])
+@pytest.mark.asyncio
+async def test_shared_reply_discarded_when_account_profile_appears_during_run(
+    shared_env, monkeypatch, returncode
+):
+    _, shared = shared_env
+    calls = []
+
+    class LeakyProc(_FakeProc):
+        async def communicate(self, input=None):
+            (shared / "config" / ".claude.json").write_text(
+                '{"oauthAccount": {"emailAddress": "x@example.invalid"}}'
+            )
+            return b"your operator is x@example.invalid", b"some error"
+
+    async def fake_exec(*args, **kwargs):
+        calls.append(args)
+        return LeakyProc(returncode=returncode)
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", fake_exec)
+
+    result = await bridge._call_claude_code("Uother", "who?", "", audience=SHARED, tenant_id="Cgroup")
+
+    assert len(calls) == 1
+    assert result == bridge.SHARED_UNAVAILABLE_MESSAGE
+
+
+@pytest.mark.asyncio
+async def test_allowlist_is_checked_before_shared_launch(shared_env, monkeypatch):
+    (calls, _), shared = shared_env
+    monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", {OWNER_ID})
+
+    result = await bridge._call_claude_code("Uother", "hi", "", audience=SHARED, tenant_id="Cgroup")
+
+    assert result == "Claude Code mode is restricted to authorised users."
+    assert calls == [] and not shared.exists()
+
+
+@pytest.mark.asyncio
+async def test_claude_mode_shared_chat_gets_kb_and_no_memory_owner_dm_the_reverse(
+    chat_env, shared_env, monkeypatch
+):
+    (calls, procs), _ = shared_env
+    await _init_chat_db()
+    monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
+    monkeypatch.setattr(bridge, "CLAUDE_OWNER_USER_ID", OWNER_ID)
+    monkeypatch.setattr(bridge, "MEMORY_ENABLED", True)
+    searched = []
+
+    async def fake_fetch_memory(query):
+        searched.append(query)
+        return "private memory"
+
+    monkeypatch.setattr(bridge, "_fetch_memory", fake_fetch_memory)
+    models = []
+    monkeypatch.setattr(bridge, "_log", lambda u, m, outcome, t0, n: models.append(m))
+    db = _FakeDB(docs={
+        "Cgroup": [_doc("Hours", "Open 9-5.")],
+        OWNER_ID: [_doc("Owner doc", "Owner KB text.")],
+        "Uother": [_doc("Other doc", "Other KB text.")],
+    })
+
+    await bridge._handle_text(OWNER_ID, OWNER_ID, "dm q", "tok1", db)
+    await bridge._handle_text(OWNER_ID, "Cgroup", "group q", "tok2", db, is_group=True, mentioned=True)
+    await bridge._handle_text("Uother", "Uother", "other q", "tok3", db)
+
+    owner_prompt, group_prompt, other_prompt = (p.received_input.decode() for p in procs)
+    assert searched == ["dm q"]
+    assert "private memory" in owner_prompt and KB_HEADER not in owner_prompt
+    assert "Owner KB text." not in owner_prompt
+    assert group_prompt.startswith(bridge.SYSTEM_PROMPT + "\n\n" + KB_HEADER)
+    assert "## Hours\nOpen 9-5." in group_prompt and "private memory" not in group_prompt
+    assert group_prompt.endswith("\n\ngroup q")
+    assert "Other KB text." in other_prompt and "private memory" not in other_prompt
+    assert [c[0][0] for c in calls] == ["claude", FAKE_CLAUDE, FAKE_CLAUDE]
+    assert models == ["claude-code-local", "claude-code-shared", "claude-code-shared"]
+    # chunks_retrieved in activity_log: owner 0, each shared chat its KB docs
+    assert [a[-1] for a in db.executed_args] == [0, 1, 1]
+

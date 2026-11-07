@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import shutil
 import signal
 import time
 from contextlib import asynccontextmanager
@@ -74,11 +75,36 @@ CLAUDE_WORKING_MESSAGE = (
     "Working on it. This one needs more time; I'll send the answer here when it's done."
 )
 # Allowlist of LINE userIds permitted to use CLAUDE_MODE.
-# Leave empty to allow only yourself — get your userId from the LINE Developers
-# Console (Users tab) or from the first webhook log after you message the bot.
+# Empty allows EVERYONE in an approved chat to trigger claude, so set it —
+# get your userId from the LINE Developers Console (Users tab).
 # Example: CLAUDE_ALLOWED_USERS=Uabc123,Udef456
 _raw = os.getenv("CLAUDE_ALLOWED_USERS", "")
 CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip()}
+# The one LINE userId whose own 1:1 chat gets the full local claude (tools,
+# MCP, memory). Every other chat is SHARED; unset means every chat is SHARED.
+CLAUDE_OWNER_USER_ID = os.getenv("CLAUDE_OWNER_USER_ID", "").strip()
+# Token from `claude setup-token` for SHARED runs. Never name it
+# CLAUDE_CODE_OAUTH_TOKEN in the bridge's environment: the owner's run
+# inherits that environment and would switch to this login.
+CLAUDE_SHARED_OAUTH_TOKEN = os.getenv("CLAUDE_SHARED_OAUTH_TOKEN", "").strip()
+# Empty home + config dir for SHARED runs, outside any repo so no CLAUDE.md,
+# settings or hooks from a parent directory are found.
+# An empty value means the default, never the bridge's working directory.
+CLAUDE_SHARED_DIR = os.path.abspath(os.path.expanduser(
+    os.getenv("CLAUDE_SHARED_DIR") or "~/.local/state/line-claude-bridge/shared"
+))
+# Fixed, not tenant-editable: it states the run's limits. The tenant persona
+# and KB follow it on stdin.
+SHARED_SYSTEM_PROMPT = (
+    "You are a helpful assistant in a shared LINE chat that several people may read. "
+    "You have no tools, files or memory beyond what is in this prompt. "
+    "Never claim to know private details about the person who operates you, "
+    "such as their name, email, accounts, files or projects."
+)
+SHARED_UNAVAILABLE_MESSAGE = os.getenv(
+    "SHARED_UNAVAILABLE_MESSAGE",
+    "The assistant is not available in this chat right now.",
+)
 HISTORY_LIMIT = 10  # rows = 5 user/assistant pairs
 MEM_CONTEXT_MAX_CHARS = 3000
 # Claude Code runs one process per message, so earlier turns are passed in the
@@ -112,6 +138,13 @@ logger = logging.getLogger(__name__)
 
 logger.info("CLAUDE_MODE=%s  MEMORY_ENABLED=%s  MEM_CLI=%s  CWD=%s",
             CLAUDE_MODE, MEMORY_ENABLED, MEM_CLI, CLAUDE_CWD)
+if CLAUDE_MODE:
+    if not CLAUDE_ALLOWED_USERS:
+        logger.warning("CLAUDE_ALLOWED_USERS is empty: anyone in an approved chat can trigger claude")
+    if not CLAUDE_OWNER_USER_ID:
+        logger.warning("CLAUDE_OWNER_USER_ID is unset: every chat, yours included, runs as shared")
+    if not CLAUDE_SHARED_OAUTH_TOKEN:
+        logger.warning("CLAUDE_SHARED_OAUTH_TOKEN is unset: shared chats get the unavailable message")
 
 parser = WebhookParser(LINE_CHANNEL_SECRET)
 line_config = Configuration(access_token=LINE_CHANNEL_ACCESS_TOKEN)
@@ -316,8 +349,11 @@ async def _save_turn(
     await db.commit()
 
 
-async def _clear_history(db: aiosqlite.Connection, user_id: str) -> None:
-    await db.execute("DELETE FROM conversations WHERE user_id = ?", (user_id,))
+async def _clear_history(db: aiosqlite.Connection, user_id: str, chat_id: str) -> None:
+    # Per chat: /clear in a group must not wipe the user's 1:1 history.
+    await db.execute(
+        "DELETE FROM conversations WHERE user_id = ? AND chat_id = ?", (user_id, chat_id)
+    )
     await db.commit()
 
 
@@ -557,23 +593,146 @@ def _format_history(history: list[dict]) -> str:
     ])
 
 
+# ---------- Audience policy ----------
+# Who reads a reply decides what the run may draw on. Only the owner's own
+# 1:1 chat gets the full local claude (tools, MCP, memory, the owner's login).
+# Every other chat — a group, a room, anyone else's 1:1 — is SHARED: an
+# answer-only claude that sees that chat's history and that tenant's KB and
+# nothing else. This is enforced by how claude is launched, not by prompt text.
+# Other channels should resolve an audience the same way and pass it on.
+
+class Audience(Enum):
+    OWNER = "owner"
+    SHARED = "shared"
+
+
+def _resolve_audience(user_id: str, tenant_id: str, is_group: bool) -> Audience:
+    # Fails closed: an unset owner id makes every chat SHARED.
+    if (
+        CLAUDE_OWNER_USER_ID
+        and not is_group
+        and user_id == CLAUDE_OWNER_USER_ID
+        and tenant_id == CLAUDE_OWNER_USER_ID
+    ):
+        return Audience.OWNER
+    return Audience.SHARED
+
+
+def _shared_account_present(config_dir: str) -> bool:
+    """True if the shared config holds a logged-in account profile.
+
+    `oauthAccount` carries the account's email; its presence means the run
+    is not on the profile-less setup-token login. An unreadable or invalid
+    file counts as present, since it can't be shown to be clean. A missing
+    file is fine (claude creates it on first run).
+    """
+    path = os.path.join(config_dir, ".claude.json")
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        return False
+    except (OSError, ValueError):
+        return True
+    return not isinstance(data, dict) or "oauthAccount" in data
+
+
+def _shared_launch() -> Optional[tuple[list[str], str, dict[str, str]]]:
+    """Build (argv, cwd, env) for a SHARED run, or None if it must not run.
+
+    No tools (any tool in a group is handed to every member), no settings,
+    hooks, MCP servers, slash commands, CLAUDE.md, auto memory or @-file
+    attachments, and a separate login. The env is a new dict: nothing from
+    the bridge's environment (.env secrets, SSH agent) is passed on.
+    """
+    if not CLAUDE_SHARED_OAUTH_TOKEN:
+        logger.warning("shared run refused: CLAUDE_SHARED_OAUTH_TOKEN is unset")
+        return None
+    claude_bin = shutil.which("claude")
+    if claude_bin is None:
+        logger.warning("shared run refused: claude binary not found on PATH")
+        return None
+    home = os.path.join(CLAUDE_SHARED_DIR, "home")
+    config = os.path.join(CLAUDE_SHARED_DIR, "config")
+    for d in (CLAUDE_SHARED_DIR, home, config):
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        os.chmod(d, 0o700)  # makedirs' mode skips existing and parent dirs
+    if _shared_account_present(config):
+        logger.error("shared run refused: %s/.claude.json holds an account profile", config)
+        return None
+    # Auto-updates swap the binary under us; the log shows which one ran.
+    logger.info("shared run claude=%s", os.path.realpath(claude_bin))
+    argv = [
+        claude_bin, "--print", "--output-format", "text",
+        "--no-session-persistence", "--restricted",
+        "--permission-prompts", "none",
+        "--setting-sources", "",
+        "--strict-mcp-config", "--mcp-config", '{"mcpServers":{}}',
+        "--tools", "",
+        "--disable-slash-commands",
+        "--system-prompt", SHARED_SYSTEM_PROMPT,
+    ]
+    if CLAUDE_CODE_MODEL:
+        argv += ["--model", CLAUDE_CODE_MODEL]
+    env = {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": home,
+        "LANG": "C.UTF-8",
+        "CLAUDE_CONFIG_DIR": config,
+        "CLAUDE_CODE_OAUTH_TOKEN": CLAUDE_SHARED_OAUTH_TOKEN,
+        # Without this, "@/abs/path" in a message attaches the file even with no tools.
+        "CLAUDE_CODE_DISABLE_ATTACHMENTS": "1",
+        "CLAUDE_CODE_DISABLE_CLAUDE_MDS": "1",
+        "CLAUDE_CODE_DISABLE_AUTO_MEMORY": "1",
+        "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+        "DISABLE_AUTOUPDATER": "1",
+    }
+    return argv, home, env
+
+
 async def _call_claude_code(
-    user_id: str, text: str, system_prompt: str, history: Optional[list[dict]] = None
+    user_id: str,
+    text: str,
+    system_prompt: str,
+    history: Optional[list[dict]] = None,
+    *,
+    audience: Audience,
+    tenant_id: str,
+    kb_block: str = "",
 ) -> str:
     # Calls the local claude binary. Prompt is passed via stdin, not argv,
     # to prevent argument injection (flag smuggling via leading dashes).
     # Only users in CLAUDE_ALLOWED_USERS may reach this function.
+    # audience has no default, so no caller can fall into OWNER by omission.
     if CLAUDE_ALLOWED_USERS and user_id not in CLAUDE_ALLOWED_USERS:
         return "Claude Code mode is restricted to authorised users."
-    memory_ctx = ""
-    if MEMORY_ENABLED:
-        memory_ctx = await _fetch_memory(text)
 
     parts = []
     if system_prompt:
         parts.append(system_prompt)
-    if memory_ctx:
-        parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
+    if audience is Audience.OWNER:
+        memory_ctx = ""
+        if MEMORY_ENABLED:
+            memory_ctx = await _fetch_memory(text)
+        if memory_ctx:
+            parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
+        cmd = ["claude", "--print", "--output-format", "text"]
+        if CLAUDE_CODE_MODEL:
+            cmd += ["--model", CLAUDE_CODE_MODEL]
+        cwd = CLAUDE_CWD
+        spawn_env = {}  # inherit the bridge's environment, as before
+        shared_config = None
+    else:
+        # OpenMemory spans every project and session; a shared chat never gets it.
+        if kb_block:
+            parts.append(kb_block)
+        launch = _shared_launch()
+        if launch is None:
+            return SHARED_UNAVAILABLE_MESSAGE
+        cmd, cwd, env = launch
+        spawn_env = {"env": env}
+        shared_config = env["CLAUDE_CONFIG_DIR"]
+        logger.info("shared run tenant=%s user=%s", _uid_hash(tenant_id), _uid_hash(user_id))
     history_block = _format_history(history or [])
     if history_block:
         parts.append(history_block)
@@ -581,22 +740,28 @@ async def _call_claude_code(
     prompt = "\n\n".join(parts)
     proc = None
     try:
-        cmd = ["claude", "--print", "--output-format", "text"]
-        if CLAUDE_CODE_MODEL:
-            cmd += ["--model", CLAUDE_CODE_MODEL]
         proc = await asyncio.create_subprocess_exec(
             *cmd,
-            cwd=CLAUDE_CWD,
+            cwd=cwd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             # Own process group, so a timeout also stops the tool shells and
             # MCP servers claude started.
             start_new_session=True,
+            **spawn_env,
         )
         stdout, stderr = await asyncio.wait_for(
             proc.communicate(input=prompt.encode()), timeout=CLAUDE_TIMEOUT_S
         )
+        if shared_config and _shared_account_present(shared_config):
+            # The run logged in with a profile after all; its reply may carry
+            # the account's details, so it is thrown away, error or not.
+            logger.error(
+                "shared run discarded: account profile appeared in %s/.claude.json",
+                shared_config,
+            )
+            return SHARED_UNAVAILABLE_MESSAGE
         if proc.returncode != 0:
             err = stderr.decode().lower()
             logger.warning("claude exit=%s stderr=%s", proc.returncode, err[:200])
@@ -743,7 +908,7 @@ async def _handle_text(
     async with aiosqlite.connect(DB_PATH) as db:
         # Command dispatch
         if text == "/clear":
-            await _clear_history(db, user_id)
+            await _clear_history(db, user_id, tenant_id)
             await asyncio.to_thread(_send_reply, reply_token, "History cleared.")
             outcome = "command"
             _log(user_id, await _get_model(db, user_id), outcome, t0, 0)
@@ -775,8 +940,10 @@ async def _handle_text(
 
         if text == "/status":
             model = await _get_model(db, user_id)
+            # This chat's rows only: the reply is read by everyone in the chat.
             async with db.execute(
-                "SELECT COUNT(*) FROM conversations WHERE user_id = ?", (user_id,)
+                "SELECT COUNT(*) FROM conversations WHERE user_id = ? AND chat_id = ?",
+                (user_id, tenant_id),
             ) as cursor:
                 row = await cursor.fetchone()
             count = row[0] if row else 0
@@ -795,12 +962,21 @@ async def _handle_text(
 
         history = await _get_history(db, user_id, tenant_id)
         if CLAUDE_MODE:
-            # Claude Code mode is the owner's operator channel: the tenant's
-            # knowledge base is customer-chat reference text, so it is left out.
-            kb_docs = 0
-            model = "claude-code-local"
+            # The owner's 1:1 is the operator channel and goes without the
+            # tenant KB (customer-chat reference text). A shared chat's only
+            # knowledge is that KB plus its own history.
+            audience = _resolve_audience(user_id, tenant_id, is_group)
+            if audience is Audience.OWNER:
+                kb_block, kb_docs = "", 0
+                model = "claude-code-local"
+            else:
+                kb_block, kb_docs = await _get_kb_context(pg_pool, tenant_id)
+                model = "claude-code-shared"
             claude_task = asyncio.create_task(
-                _call_claude_code(user_id, text, effective_system_prompt, history)
+                _call_claude_code(
+                    user_id, text, effective_system_prompt, history,
+                    audience=audience, tenant_id=tenant_id, kb_block=kb_block,
+                )
             )
             try:
                 done, _ = await asyncio.wait({claude_task}, timeout=CLAUDE_REPLY_WINDOW_S)

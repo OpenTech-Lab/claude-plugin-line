@@ -230,6 +230,77 @@ By default the bot only responds when @mentioned (`groupTrigger: mention`). Chan
 
 ---
 
+## Shared chats (pm2 bridge, Claude mode)
+
+Everyone in a chat reads the bot's reply, so what a Claude-mode run may draw
+on depends on who is in the chat.
+
+**The rule.** A chat is `OWNER` only when it is a 1:1 chat and the sender and
+the chat are both `CLAUDE_OWNER_USER_ID`. Every other chat (a group, a room,
+or anyone else's 1:1) is `SHARED`. If `CLAUDE_OWNER_USER_ID` is unset, every
+chat is `SHARED`. `CLAUDE_ALLOWED_USERS` still decides who may trigger claude
+at all; an empty list allows everyone.
+
+| | `OWNER` | `SHARED` |
+|---|---|---|
+| Tools, MCP servers, skills, hooks, CLAUDE.md | Your normal setup | None |
+| OpenMemory (`MEMORY_ENABLED`) | Yes | Never |
+| Tenant knowledge base (dashboard) | No | Yes |
+| History | This chat's | This chat's |
+| Login | Your normal `claude` login | `CLAUDE_SHARED_OAUTH_TOKEN` |
+| Model in the bridge's log | `claude-code-local` | `claude-code-shared` |
+
+**Launch profile.** A shared run is enforced by how `claude` is started, not by
+prompt text:
+
+```
+claude --print --output-format text --no-session-persistence --restricted
+  --permission-prompts none --setting-sources "" --strict-mcp-config
+  --mcp-config '{"mcpServers":{}}' --tools "" --disable-slash-commands
+  --system-prompt <fixed shared prompt> [--model $CLAUDE_CODE_MODEL]
+cwd = $CLAUDE_SHARED_DIR/home   (empty, mode 700)
+env = a new environment; nothing is copied from the bridge's:
+  PATH=/usr/local/bin:/usr/bin:/bin  HOME=$CLAUDE_SHARED_DIR/home  LANG=C.UTF-8
+  CLAUDE_CONFIG_DIR=$CLAUDE_SHARED_DIR/config
+  CLAUDE_CODE_OAUTH_TOKEN=$CLAUDE_SHARED_OAUTH_TOKEN
+  CLAUDE_CODE_DISABLE_ATTACHMENTS=1  CLAUDE_CODE_DISABLE_CLAUDE_MDS=1
+  CLAUDE_CODE_DISABLE_AUTO_MEMORY=1  ENABLE_CLAUDEAI_MCP_SERVERS=false
+  DISABLE_AUTOUPDATER=1
+```
+
+The prompt on stdin is the tenant persona, the tenant's knowledge base, this
+chat's recent history, and the message. Create the token with
+`claude setup-token` and store it as `CLAUDE_SHARED_OAUTH_TOKEN`. Never name it
+`CLAUDE_CODE_OAUTH_TOKEN` in the bridge's environment: the owner's run
+inherits that environment and would switch logins.
+
+The run fails closed, and the chat gets `SHARED_UNAVAILABLE_MESSAGE`, when the
+token is unset, `claude` is not on `PATH`, or
+`$CLAUDE_SHARED_DIR/config/.claude.json` holds an account profile
+(`oauthAccount`) or can't be read. The file is checked again after the run; if
+a profile appeared, the reply is thrown away. Each shared run logs the resolved
+`claude` binary, so auto-updates show up in the logs.
+
+**Contract for other channels.** A channel that runs `claude` for a chat
+should resolve an audience the same way (`OWNER` only for the owner's own 1:1,
+`SHARED` otherwise, `SHARED` when unsure) and pass it explicitly. In this
+bridge, `_call_claude_code(..., audience=..., tenant_id=...)` has no default
+for either, so no caller can fall into `OWNER` by omission, and a `SHARED` run
+takes its argv, cwd and environment from `_shared_launch()`.
+
+**End-to-end check.** The isolation leans on undocumented
+`CLAUDE_CODE_DISABLE_*` switches, so re-run this after every `claude` update.
+It plants marker words in CLAUDE.md and AGENTS.md files, a SessionStart hook
+and a file outside the sandbox, then makes three real runs on the shared login:
+
+```bash
+LINE_BRIDGE_E2E=1 venv/bin/python -m pytest -q tests/test_shared_isolation_e2e.py
+```
+
+It is skipped unless `LINE_BRIDGE_E2E=1` and `CLAUDE_SHARED_OAUTH_TOKEN` are set.
+
+---
+
 ## Slash Commands
 
 | Command | Effect |
@@ -316,6 +387,11 @@ The pm2 bridge in Claude mode (`CLAUDE_MODE=true`) also reads:
 |----------|---------|-------------|
 | `CLAUDE_TIMEOUT_S` | `1200` | Seconds a `claude --print` run may take before it and its tool processes are stopped |
 | `CLAUDE_REPLY_WINDOW_S` | `45` | A run still going after this gets a free "working on it" reply, and its answer is sent by push (counts toward the monthly message quota). LINE guarantees reply tokens for one minute only |
+| `CLAUDE_ALLOWED_USERS` | — | Comma-separated LINE userIds allowed to trigger claude. Empty allows everyone |
+| `CLAUDE_OWNER_USER_ID` | — | Your LINE userId. Only your own 1:1 chat gets the full setup; unset makes every chat shared. See [Shared chats](#shared-chats-pm2-bridge-claude-mode) |
+| `CLAUDE_SHARED_OAUTH_TOKEN` | — | Token from `claude setup-token`, used only for shared chats. Unset means shared chats get `SHARED_UNAVAILABLE_MESSAGE` |
+| `CLAUDE_SHARED_DIR` | `~/.local/state/line-claude-bridge/shared` | Empty home and config directory for shared runs; keep it outside any repo |
+| `SHARED_UNAVAILABLE_MESSAGE` | `The assistant is not available in this chat right now.` | Reply sent when a shared run is refused |
 
 ---
 
