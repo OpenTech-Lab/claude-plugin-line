@@ -3,6 +3,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import shutil
 import signal
@@ -93,8 +94,50 @@ CLAUDE_OPERATOR_CHATS: set[str] = {c.strip() for c in _raw_ops.split(",") if c.s
 OPERATOR_GROUP_NOTE = (
     "[This reply is posted in a LINE group that other people read. "
     "Include private details (emails, credentials, unrelated projects) "
-    "only when the request needs them.]"
+    "only when the request needs them. Write plain sentences: lines with "
+    "commands, ids or links are removed before the reply is posted. If a step "
+    "is blocked, say the owner has to confirm it.]"
 )
+# An owner run in a group can see everything the owner's tools return, and
+# prompt rules alone did not keep commands and ids out of its replies. These
+# are removed in code before the reply is posted.
+_UUID_RE = re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
+_URL_RE = re.compile(r"https?://|www\.", re.I)
+_COMMAND_RE = re.compile(
+    r"^[\s\-*•>]*(\$ |(syadmin|gh|git|aws|curl|cd|python3?|pnpm|npm|npx|sudo|pm2|"
+    r"claude|ssh|install|chmod|bash|sh|export|mem)(\s|$))"
+)
+# Lines that only point at a removed command ("run this in a terminal:").
+_COMMAND_INTRO_RE = re.compile(r"終端機|以下指令|指令如下|執行指令|\bterminal\b|run (this|the following)", re.I)
+GROUP_REPLY_FALLBACK ="已處理，詳細內容請向管理者確認。"
+
+
+def _plain_group_reply(text: str) -> str:
+    """Drop code blocks and lines with commands, ids or links; strip markdown."""
+    kept, in_fence, dropped = [], False, 0
+    for line in text.splitlines():
+        if line.strip().startswith("```"):
+            in_fence = not in_fence
+            dropped += 1
+            continue
+        if (
+            in_fence
+            or _UUID_RE.search(line)
+            or _URL_RE.search(line)
+            or _COMMAND_RE.match(line)
+            or _COMMAND_INTRO_RE.search(line)
+        ):
+            dropped += 1
+            continue
+        line = re.sub(r"^\s*#+\s+", "", line)
+        line = line.replace("**", "").replace("__", "").replace("`", "")
+        if re.fullmatch(r"\s*\|?[\s:\-|]+\|?\s*", line) and "-" in line:
+            continue  # markdown table separator
+        kept.append(line.rstrip())
+    out = re.sub(r"\n{3,}", "\n\n", "\n".join(kept)).strip()
+    if dropped:
+        logger.info("group reply: removed %d line(s) with commands, ids or links", dropped)
+    return out or GROUP_REPLY_FALLBACK
 # Token from `claude setup-token` for SHARED runs. Never name it
 # CLAUDE_CODE_OAUTH_TOKEN in the bridge's environment: the owner's run
 # inherits that environment and would switch to this login.
@@ -788,7 +831,10 @@ async def _call_claude_code(
             if any(k in err for k in ("timeout", "timed out")):
                 return "Request timed out. Please try again."
             return "Something went wrong. Please try again later."
-        return stdout.decode().strip() or "No response."
+        reply = stdout.decode().strip() or "No response."
+        if audience is Audience.OWNER and tenant_id != user_id:
+            reply = _plain_group_reply(reply)
+        return reply
     except asyncio.TimeoutError:
         logger.warning("claude timeout after %ss user=%s", CLAUDE_TIMEOUT_S, _uid_hash(user_id))
         await _stop_process_group(proc)

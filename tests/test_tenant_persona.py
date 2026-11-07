@@ -1386,3 +1386,48 @@ async def test_claude_mode_shared_chat_gets_kb_and_no_memory_owner_dm_the_revers
     # chunks_retrieved in activity_log: owner 0, each shared chat its KB docs
     assert [a[-1] for a in db.executed_args] == [0, 1, 1]
 
+
+
+BLOCKED_REPLY = """已套用 15 則圖片說明修改，還有 19 則待處理。
+
+系統攔截了後續批次的核准動作。請您在終端機執行以下指令完成剩餘 19 則：
+
+syadmin changes apply 00000000-0000-4000-8000-000000000001 00000000-0000-4000-8000-000000000002
+
+```
+gh pr merge 26 --repo example/site --merge
+```
+或直接前往 PR 頁面：https://github.com/example/site/pull/26
+## **結果**
+- `首頁` SEO 分數 84 → 92
+
+或者告訴我，我會請系統開放權限後繼續執行。"""
+
+
+def test_plain_group_reply_drops_commands_ids_links_and_markdown():
+    out = bridge._plain_group_reply(BLOCKED_REPLY)
+    assert "已套用 15 則圖片說明修改，還有 19 則待處理。" in out
+    assert "首頁 SEO 分數 84 → 92" in out
+    assert "結果" in out
+    for bad in ("syadmin", "00000000-0000", "gh pr", "https://", "```", "**", "`", "##", "終端機"):
+        assert bad not in out
+    assert "\n\n\n" not in out
+
+
+def test_plain_group_reply_keeps_plain_text_and_falls_back_when_empty():
+    plain = "首頁 SEO 分數 84 → 92\n已補上 12 張作品集圖片的說明。"
+    assert bridge._plain_group_reply(plain) == plain
+    assert bridge._plain_group_reply("syadmin changes apply 1") == bridge.GROUP_REPLY_FALLBACK
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("tenant_id, filtered", [("Cops", True), ("Uabc", False)], ids=["group", "owner-1to1"])
+async def test_owner_reply_is_filtered_only_in_groups(spawns, monkeypatch, tenant_id, filtered):
+    monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
+
+    async def fake_exec(*args, **kwargs):
+        return _FakeProc(stdout=BLOCKED_REPLY.encode())
+
+    monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", fake_exec)
+    out = await bridge._call_claude_code("Uabc", "hi", "", audience=OWNER, tenant_id=tenant_id)
+    assert ("00000000-0000" in out) is not filtered
