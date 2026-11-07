@@ -740,6 +740,55 @@ async def test_claude_mode_leaves_out_knowledge_base_and_passes_history(chat_env
     ]
 
 
+@pytest.mark.asyncio
+async def test_claude_mode_history_is_per_chat(chat_env, monkeypatch):
+    await _init_chat_db()
+    monkeypatch.setattr(bridge, "CLAUDE_MODE", True)
+    calls = []
+
+    async def fake_call_claude_code(user_id, text, system_prompt, history=None):
+        calls.append(history)
+        return f"re: {text}"
+
+    monkeypatch.setattr(bridge, "_call_claude_code", fake_call_claude_code)
+    db = _FakeDB()
+
+    await bridge._handle_text("Uabc", "Uabc", "private plan", "tok1", db)
+    await bridge._handle_text("Uabc", "Cgroup", "group q", "tok2", db, is_group=True, mentioned=True)
+    await bridge._handle_text("Uabc", "Uabc", "follow up", "tok3", db)
+
+    # The group sees none of the 1:1 turns, and the 1:1 sees none of the group's.
+    assert calls[1] == []
+    assert calls[2] == [
+        {"role": "user", "content": "private plan"},
+        {"role": "assistant", "content": "re: private plan"},
+    ]
+
+
+@pytest.mark.asyncio
+async def test_init_db_adds_chat_id_and_leaves_old_rows_out_of_history(chat_env):
+    async with bridge.aiosqlite.connect(bridge.DB_PATH) as db:
+        await db.execute(
+            """CREATE TABLE conversations (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT NOT NULL,
+                ts DATETIME DEFAULT CURRENT_TIMESTAMP
+            )"""
+        )
+        await db.execute(
+            "INSERT INTO conversations(user_id, role, content) VALUES('Uabc', 'user', 'old dm')"
+        )
+        await db.commit()
+
+        await bridge._init_db(db)
+        await bridge._init_db(db)  # idempotent
+
+        assert await bridge._get_history(db, "Uabc", "Uabc") == []
+        assert await bridge._get_history(db, "Uabc", "Cgroup") == []
+
+
 def test_format_history_renders_delimited_transcript():
     block = bridge._format_history([
         {"role": "user", "content": "release"},
@@ -961,7 +1010,7 @@ async def test_slow_claude_run_sends_notice_then_pushes_answer_to_chat(claude_wi
     assert pushes == [("Cgroup", "long answer")]
     assert logged == ["ok"]
     async with bridge.aiosqlite.connect(bridge.DB_PATH) as db:
-        assert await bridge._get_history(db, "Uabc") == [
+        assert await bridge._get_history(db, "Uabc", "Cgroup") == [
             {"role": "user", "content": "audit"},
             {"role": "assistant", "content": "long answer"},
         ]

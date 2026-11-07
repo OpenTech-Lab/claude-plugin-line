@@ -144,13 +144,23 @@ async def _init_db(db: aiosqlite.Connection) -> None:
         CREATE TABLE IF NOT EXISTS conversations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             user_id TEXT NOT NULL,
+            chat_id TEXT,
             role TEXT NOT NULL,
             content TEXT NOT NULL,
             ts DATETIME DEFAULT CURRENT_TIMESTAMP
         )
     """)
+    # History is per chat: a group must never see the user's 1:1 turns.
+    # Rows from before chat_id existed stay NULL and are never read back.
+    async with db.execute("PRAGMA table_info(conversations)") as cursor:
+        columns = {row[1] for row in await cursor.fetchall()}
+    if "chat_id" not in columns:
+        await db.execute("ALTER TABLE conversations ADD COLUMN chat_id TEXT")
     await db.execute(
         "CREATE INDEX IF NOT EXISTS idx_conv_user_ts ON conversations(user_id, ts)"
+    )
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conv_user_chat_ts ON conversations(user_id, chat_id, ts)"
     )
     await db.execute("""
         CREATE TABLE IF NOT EXISTS user_settings (
@@ -285,23 +295,23 @@ async def _set_model(db: aiosqlite.Connection, user_id: str, model: str) -> None
     await db.commit()
 
 
-async def _get_history(db: aiosqlite.Connection, user_id: str) -> list[dict]:
+async def _get_history(db: aiosqlite.Connection, user_id: str, chat_id: str) -> list[dict]:
     async with db.execute(
         """SELECT role, content FROM conversations
-           WHERE user_id = ?
-           ORDER BY ts DESC LIMIT ?""",
-        (user_id, HISTORY_LIMIT),
+           WHERE user_id = ? AND chat_id = ?
+           ORDER BY ts DESC, id DESC LIMIT ?""",
+        (user_id, chat_id, HISTORY_LIMIT),
     ) as cursor:
         rows = await cursor.fetchall()
     return [{"role": r[0], "content": r[1]} for r in reversed(rows)]
 
 
 async def _save_turn(
-    db: aiosqlite.Connection, user_id: str, user_text: str, assistant_text: str
+    db: aiosqlite.Connection, user_id: str, chat_id: str, user_text: str, assistant_text: str
 ) -> None:
     await db.executemany(
-        "INSERT INTO conversations(user_id, role, content) VALUES(?, ?, ?)",
-        [(user_id, "user", user_text), (user_id, "assistant", assistant_text)],
+        "INSERT INTO conversations(user_id, chat_id, role, content) VALUES(?, ?, ?, ?)",
+        [(user_id, chat_id, "user", user_text), (user_id, chat_id, "assistant", assistant_text)],
     )
     await db.commit()
 
@@ -783,7 +793,7 @@ async def _handle_text(
         # Normal message flow
         model = await _get_model(db, user_id)
 
-        history = await _get_history(db, user_id)
+        history = await _get_history(db, user_id, tenant_id)
         if CLAUDE_MODE:
             # Claude Code mode is the owner's operator channel: the tenant's
             # knowledge base is customer-chat reference text, so it is left out.
@@ -809,7 +819,7 @@ async def _handle_text(
             else:
                 if "error" in reply_text.lower()[:20]:
                     outcome = "error"
-                await _save_turn(db, user_id, text, reply_text)
+                await _save_turn(db, user_id, tenant_id, text, reply_text)
             finally:
                 # asyncio.wait doesn't pass a cancellation of this handler on.
                 claude_task.cancel()
@@ -825,7 +835,7 @@ async def _handle_text(
                 reply_text = await _call_openrouter(model, messages)
                 if not reply_text or not reply_text.strip():
                     reply_text = "Received an empty response."
-                await _save_turn(db, user_id, text, reply_text)
+                await _save_turn(db, user_id, tenant_id, text, reply_text)
             except httpx.TimeoutException:
                 reply_text = "Sorry, couldn't reach Claude right now (timeout)."
                 outcome = "error"
