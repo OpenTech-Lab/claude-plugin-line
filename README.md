@@ -310,6 +310,13 @@ Use the `download_attachment` MCP tool to fetch video/audio/file to the local in
 | `LINE_ACCESS_MODE` | — | Set to `static` to lock access.json at boot |
 | `LINE_DEBUG` | — | Set to `1` to log all webhook payloads to `debug.log` |
 
+The pm2 bridge in Claude mode (`CLAUDE_MODE=true`) also reads:
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CLAUDE_TIMEOUT_S` | `1200` | Seconds a `claude --print` run may take before it and its tool processes are stopped |
+| `CLAUDE_REPLY_WINDOW_S` | `45` | A run still going after this gets a free "working on it" reply, and its answer is sent by push (counts toward the monthly message quota). LINE guarantees reply tokens for one minute only |
+
 ---
 
 ## Troubleshooting

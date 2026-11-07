@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import secrets
+import signal
 import time
 from contextlib import asynccontextmanager
 from enum import Enum
@@ -59,6 +60,19 @@ CLAUDE_CWD = os.getenv("CLAUDE_CWD", os.path.expanduser("~"))
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 MEM_CLI = os.getenv("MEM_CLI", "/home/toyofumi/projects/openmemory/scripts/mem")
 CLAUDE_CODE_MODEL = os.getenv("CLAUDE_CODE_MODEL", "")  # e.g. claude-haiku-4-5-20251001; empty = claude default
+# Skill-driven requests (SEO audits etc.) make 15+ tool calls and run past
+# 100s; an edit-then-release job took over 300s. The answer goes out by push
+# after CLAUDE_REPLY_WINDOW_S, so a long limit costs nothing, while stopping
+# a run part way can leave edits made but not released. Seconds.
+CLAUDE_TIMEOUT_S = float(os.getenv("CLAUDE_TIMEOUT_S", "1200"))
+# Grace period between SIGTERM and SIGKILL when stopping a timed-out run.
+CLAUDE_KILL_GRACE_S = 5
+# LINE guarantees a reply token for one minute only. A run still going after
+# this window gets a free "working on it" reply, and its answer goes out by push.
+CLAUDE_REPLY_WINDOW_S = float(os.getenv("CLAUDE_REPLY_WINDOW_S", "45"))
+CLAUDE_WORKING_MESSAGE = (
+    "Working on it. This one needs more time; I'll send the answer here when it's done."
+)
 # Allowlist of LINE userIds permitted to use CLAUDE_MODE.
 # Leave empty to allow only yourself — get your userId from the LINE Developers
 # Console (Users tab) or from the first webhook log after you message the bot.
@@ -67,6 +81,16 @@ _raw = os.getenv("CLAUDE_ALLOWED_USERS", "")
 CLAUDE_ALLOWED_USERS: set[str] = {u.strip() for u in _raw.split(",") if u.strip()}
 HISTORY_LIMIT = 10  # rows = 5 user/assistant pairs
 MEM_CONTEXT_MAX_CHARS = 3000
+# Claude Code runs one process per message, so earlier turns are passed in the
+# prompt. Each turn is capped, and the oldest turns are dropped past the budget.
+HISTORY_TURN_MAX_CHARS = 1500
+HISTORY_CONTEXT_MAX_CHARS = 6000
+HISTORY_CONTEXT_HEADER = (
+    "[Recent conversation {nonce} — earlier messages in this chat, oldest first. "
+    "Use it to understand follow-ups such as \"is it done?\". It ends only at the "
+    "line [End recent conversation {nonce}].]"
+)
+HISTORY_CONTEXT_FOOTER = "[End recent conversation {nonce}]"
 # Budget for the tenant's knowledge-base text appended to the system prompt.
 KB_CONTEXT_MAX_CHARS = int(os.getenv("KB_CONTEXT_MAX_CHARS", "8000"))
 # The delimiters carry a fresh random nonce per request, so document text
@@ -494,7 +518,38 @@ async def _fetch_memory(query: str) -> str:
         return ""
 
 
-async def _call_claude_code(user_id: str, text: str, system_prompt: str) -> str:
+def _format_history(history: list[dict]) -> str:
+    """Render earlier turns as a delimited transcript, newest kept within budget."""
+    lines: list[str] = []
+    used = 0
+    for turn in reversed(history):
+        content = " ".join((turn.get("content") or "").split())
+        if not content:
+            continue
+        if len(content) > HISTORY_TURN_MAX_CHARS:
+            content = content[:HISTORY_TURN_MAX_CHARS].rstrip() + " ... (truncated)"
+        speaker = "Assistant" if turn.get("role") == "assistant" else "User"
+        # Earlier replies may quote these markers; keep them from closing the block.
+        line = f"{speaker}: {content}".replace(
+            "[End recent conversation", "(End recent conversation"
+        ).replace("[Recent conversation", "(Recent conversation")
+        if used + len(line) > HISTORY_CONTEXT_MAX_CHARS:
+            break
+        lines.append(line)
+        used += len(line) + 1
+    if not lines:
+        return ""
+    nonce = _kb_nonce()
+    return "\n".join([
+        HISTORY_CONTEXT_HEADER.format(nonce=nonce),
+        *reversed(lines),
+        HISTORY_CONTEXT_FOOTER.format(nonce=nonce),
+    ])
+
+
+async def _call_claude_code(
+    user_id: str, text: str, system_prompt: str, history: Optional[list[dict]] = None
+) -> str:
     # Calls the local claude binary. Prompt is passed via stdin, not argv,
     # to prevent argument injection (flag smuggling via leading dashes).
     # Only users in CLAUDE_ALLOWED_USERS may reach this function.
@@ -509,8 +564,12 @@ async def _call_claude_code(user_id: str, text: str, system_prompt: str) -> str:
         parts.append(system_prompt)
     if memory_ctx:
         parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
+    history_block = _format_history(history or [])
+    if history_block:
+        parts.append(history_block)
     parts.append(text)
     prompt = "\n\n".join(parts)
+    proc = None
     try:
         cmd = ["claude", "--print", "--output-format", "text"]
         if CLAUDE_CODE_MODEL:
@@ -521,9 +580,12 @@ async def _call_claude_code(user_id: str, text: str, system_prompt: str) -> str:
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
+            # Own process group, so a timeout also stops the tool shells and
+            # MCP servers claude started.
+            start_new_session=True,
         )
         stdout, stderr = await asyncio.wait_for(
-            proc.communicate(input=prompt.encode()), timeout=110
+            proc.communicate(input=prompt.encode()), timeout=CLAUDE_TIMEOUT_S
         )
         if proc.returncode != 0:
             err = stderr.decode().lower()
@@ -539,10 +601,36 @@ async def _call_claude_code(user_id: str, text: str, system_prompt: str) -> str:
             return "Something went wrong. Please try again later."
         return stdout.decode().strip() or "No response."
     except asyncio.TimeoutError:
-        proc.kill()
-        return "Taking too long to respond. Please try again."
+        logger.warning("claude timeout after %ss user=%s", CLAUDE_TIMEOUT_S, _uid_hash(user_id))
+        await _stop_process_group(proc)
+        raise ClaudeCodeTimeout from None
+    except asyncio.CancelledError:
+        # Its own session means a bridge restart won't take it down; do it here.
+        if proc is not None:
+            await _stop_process_group(proc)
+        raise
     except FileNotFoundError:
         return "claude binary not found. Is Claude Code installed and on PATH?"
+
+
+class ClaudeCodeTimeout(Exception):
+    """The claude run passed CLAUDE_TIMEOUT_S and was stopped."""
+
+
+async def _stop_process_group(proc: asyncio.subprocess.Process) -> None:
+    # SIGTERM first so claude can shut its MCP servers down, then SIGKILL the
+    # group for anything that outlived it (e.g. a hung tool shell). wait()
+    # reaps the child so it doesn't linger as a zombie.
+    try:
+        os.killpg(proc.pid, signal.SIGTERM)
+        await asyncio.wait_for(proc.wait(), timeout=CLAUDE_KILL_GRACE_S)
+    except (ProcessLookupError, asyncio.TimeoutError):
+        pass
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    await proc.wait()
 
 
 def _send_reply(reply_token: str, text: str) -> None:
@@ -574,6 +662,14 @@ async def _send_pending_notice(reply_token: str, tenant_id: str) -> None:
         logger.warning("pending_notice_failed tenant=%s err=%s", tenant_id, e)
 
 
+async def _send_working_notice(reply_token: str, user_id: str) -> None:
+    # A lost notice is cosmetic: the answer still goes out by push.
+    try:
+        await asyncio.to_thread(_send_reply, reply_token, CLAUDE_WORKING_MESSAGE)
+    except Exception as e:
+        logger.warning("working_notice_failed user=%s err=%s", _uid_hash(user_id), e)
+
+
 def _show_loading(user_id: str) -> None:
     # Only supported in 1:1 chats; failures are cosmetic.
     try:
@@ -597,6 +693,7 @@ async def _handle_text(
 ) -> None:
     t0 = time.time()
     outcome = "ok"
+    deliver_by_push = False
 
     status, tenant_config = await _get_tenant_config(pg_pool, tenant_id)
     if status is TenantStatus.UNKNOWN:
@@ -687,15 +784,38 @@ async def _handle_text(
         model = await _get_model(db, user_id)
 
         history = await _get_history(db, user_id)
-        kb_block, kb_docs = await _get_kb_context(pg_pool, tenant_id)
-        system_prompt = "\n\n".join(p for p in (effective_system_prompt, kb_block) if p)
         if CLAUDE_MODE:
+            # Claude Code mode is the owner's operator channel: the tenant's
+            # knowledge base is customer-chat reference text, so it is left out.
+            kb_docs = 0
             model = "claude-code-local"
-            reply_text = await _call_claude_code(user_id, text, system_prompt)
-            if "error" in reply_text.lower()[:20]:
-                outcome = "error"
-            await _save_turn(db, user_id, text, reply_text)
+            claude_task = asyncio.create_task(
+                _call_claude_code(user_id, text, effective_system_prompt, history)
+            )
+            try:
+                done, _ = await asyncio.wait({claude_task}, timeout=CLAUDE_REPLY_WINDOW_S)
+                if not done:
+                    await _send_working_notice(reply_token, user_id)
+                    deliver_by_push = True
+                reply_text = await claude_task
+            except ClaudeCodeTimeout:
+                # Not saved: a stop notice is not an answer to build follow-ups on.
+                reply_text = (
+                    f"Stopped after {CLAUDE_TIMEOUT_S:g}s without finishing. "
+                    "Some steps may already be done, so check before retrying, "
+                    "or split the request into smaller steps."
+                )
+                outcome = "timeout"
+            else:
+                if "error" in reply_text.lower()[:20]:
+                    outcome = "error"
+                await _save_turn(db, user_id, text, reply_text)
+            finally:
+                # asyncio.wait doesn't pass a cancellation of this handler on.
+                claude_task.cancel()
         else:
+            kb_block, kb_docs = await _get_kb_context(pg_pool, tenant_id)
+            system_prompt = "\n\n".join(p for p in (effective_system_prompt, kb_block) if p)
             messages = (
                 [{"role": "system", "content": system_prompt}]
                 + history
@@ -719,19 +839,28 @@ async def _handle_text(
                 reply_text = "Received an empty response from the AI."
                 outcome = "error"
 
-        try:
-            await asyncio.to_thread(_send_reply, reply_token, reply_text)
-        except Exception as e:
-            # Reply token may have expired; log silently
-            logger.warning("reply_failed user=%s err=%s", _uid_hash(user_id), str(e))
-            if PUSH_FALLBACK and "Invalid reply token" in str(e):
-                try:
-                    await asyncio.to_thread(_send_push, tenant_id, reply_text)
-                    logger.info("push_fallback_sent user=%s", _uid_hash(user_id))
-                except Exception as push_err:
-                    logger.warning(
-                        "push_fallback_failed user=%s err=%s", _uid_hash(user_id), str(push_err)
-                    )
+        if deliver_by_push:
+            # The reply token went to the working notice; push is the only way left.
+            try:
+                await asyncio.to_thread(_send_push, tenant_id, reply_text)
+                logger.info("push_sent user=%s", _uid_hash(user_id))
+            except Exception as e:
+                logger.warning("push_failed user=%s err=%s", _uid_hash(user_id), str(e))
+                outcome = "error"
+        else:
+            try:
+                await asyncio.to_thread(_send_reply, reply_token, reply_text)
+            except Exception as e:
+                # Reply token may have expired; log silently
+                logger.warning("reply_failed user=%s err=%s", _uid_hash(user_id), str(e))
+                if PUSH_FALLBACK and "Invalid reply token" in str(e):
+                    try:
+                        await asyncio.to_thread(_send_push, tenant_id, reply_text)
+                        logger.info("push_fallback_sent user=%s", _uid_hash(user_id))
+                    except Exception as push_err:
+                        logger.warning(
+                            "push_fallback_failed user=%s err=%s", _uid_hash(user_id), str(push_err)
+                        )
 
         await _log_activity(pg_pool, tenant_id, user_id, text, chunks_retrieved=kb_docs)
         _log(user_id, model, outcome, t0, len(history))
