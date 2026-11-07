@@ -1167,6 +1167,7 @@ def spawns(monkeypatch):
     monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", fake_exec)
     monkeypatch.setattr(bridge, "CLAUDE_ALLOWED_USERS", set())
     monkeypatch.setattr(bridge, "CLAUDE_CODE_MODEL", "")
+    monkeypatch.setattr(bridge, "CLAUDE_CODE_EFFORT", "")
     monkeypatch.setattr(bridge.shutil, "which", lambda name: FAKE_CLAUDE if name == "claude" else None)
     return calls, procs
 
@@ -1431,3 +1432,20 @@ async def test_owner_reply_is_filtered_only_in_groups(spawns, monkeypatch, tenan
     monkeypatch.setattr(bridge.asyncio, "create_subprocess_exec", fake_exec)
     out = await bridge._call_claude_code("Uabc", "hi", "", audience=OWNER, tenant_id=tenant_id)
     assert ("00000000-0000" in out) is not filtered
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("audience, tenant_id", [(OWNER, "Uabc"), (SHARED, "Cgroup")], ids=["owner", "shared"])
+async def test_model_and_effort_flags_reach_every_run(shared_env, monkeypatch, audience, tenant_id):
+    (calls, _), _ = shared_env
+    monkeypatch.setattr(bridge, "MEMORY_ENABLED", False)
+    monkeypatch.setattr(bridge, "CLAUDE_CODE_MODEL", "claude-opus-x")
+    monkeypatch.setattr(bridge, "CLAUDE_CODE_EFFORT", "high")
+    user_id = "Uabc" if audience is OWNER else "Uother"
+
+    await bridge._call_claude_code(user_id, "hi", "", audience=audience, tenant_id=tenant_id)
+
+    (args, _), = calls
+    args = list(args)
+    assert args[args.index("--model") + 1] == "claude-opus-x"
+    assert args[args.index("--effort") + 1] == "high"

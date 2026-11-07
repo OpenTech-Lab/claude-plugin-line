@@ -264,7 +264,7 @@ prompt text:
 claude --print --output-format text --no-session-persistence --restricted
   --permission-prompts none --setting-sources "" --strict-mcp-config
   --mcp-config '{"mcpServers":{}}' --tools "" --disable-slash-commands
-  --system-prompt <fixed shared prompt> [--model $CLAUDE_CODE_MODEL]
+  --system-prompt <fixed shared prompt> [--model $CLAUDE_CODE_MODEL] [--effort $CLAUDE_CODE_EFFORT]
 cwd = $CLAUDE_SHARED_DIR/home   (empty, mode 700)
 env = a new environment; nothing is copied from the bridge's:
   PATH=/usr/local/bin:/usr/bin:/bin  HOME=$CLAUDE_SHARED_DIR/home  LANG=C.UTF-8
@@ -392,6 +392,8 @@ The pm2 bridge in Claude mode (`CLAUDE_MODE=true`) also reads:
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `CLAUDE_CODE_MODEL` | — | `--model` for every claude run (owner and shared), e.g. `claude-opus-5-5`. Empty uses claude's default |
+| `CLAUDE_CODE_EFFORT` | — | `--effort` for every claude run: `low`, `medium`, `high`, `xhigh` or `max`. Empty uses the owner's settings (owner runs) or claude's default (shared runs). Subagents keep the effort in their own definitions |
 | `CLAUDE_TIMEOUT_S` | `1200` | Seconds a `claude --print` run may take before it and its tool processes are stopped |
 | `CLAUDE_REPLY_WINDOW_S` | `45` | A run still going after this gets a free "working on it" reply, and its answer is sent by push (counts toward the monthly message quota). LINE guarantees reply tokens for one minute only |
 | `CLAUDE_ALLOWED_USERS` | — | Comma-separated LINE userIds allowed to trigger claude. Empty allows everyone |

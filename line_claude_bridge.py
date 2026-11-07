@@ -62,6 +62,21 @@ CLAUDE_CWD = os.getenv("CLAUDE_CWD", os.path.expanduser("~"))
 MEMORY_ENABLED = os.getenv("MEMORY_ENABLED", "false").lower() == "true"
 MEM_CLI = os.getenv("MEM_CLI", "/home/toyofumi/projects/openmemory/scripts/mem")
 CLAUDE_CODE_MODEL = os.getenv("CLAUDE_CODE_MODEL", "")  # e.g. claude-haiku-4-5-20251001; empty = claude default
+# --effort for every run; empty = the owner's settings (owner) / claude's default (shared)
+CLAUDE_EFFORT_LEVELS = ("low", "medium", "high", "xhigh", "max")
+CLAUDE_CODE_EFFORT = os.getenv("CLAUDE_CODE_EFFORT", "").strip().lower()
+if CLAUDE_CODE_EFFORT and CLAUDE_CODE_EFFORT not in CLAUDE_EFFORT_LEVELS:
+    logging.getLogger(__name__).warning(
+        "CLAUDE_CODE_EFFORT=%r is not one of %s; ignored", CLAUDE_CODE_EFFORT, ", ".join(CLAUDE_EFFORT_LEVELS)
+    )
+    CLAUDE_CODE_EFFORT = ""
+
+
+def _model_args() -> list[str]:
+    args = ["--model", CLAUDE_CODE_MODEL] if CLAUDE_CODE_MODEL else []
+    if CLAUDE_CODE_EFFORT:
+        args += ["--effort", CLAUDE_CODE_EFFORT]
+    return args
 # Skill-driven requests (SEO audits etc.) make 15+ tool calls and run past
 # 100s; an edit-then-release job took over 300s. The answer goes out by push
 # after CLAUDE_REPLY_WINDOW_S, so a long limit costs nothing, while stopping
@@ -727,8 +742,7 @@ def _shared_launch() -> Optional[tuple[list[str], str, dict[str, str]]]:
         "--disable-slash-commands",
         "--system-prompt", SHARED_SYSTEM_PROMPT,
     ]
-    if CLAUDE_CODE_MODEL:
-        argv += ["--model", CLAUDE_CODE_MODEL]
+    argv += _model_args()
     env = {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": home,
@@ -773,9 +787,7 @@ async def _call_claude_code(
             memory_ctx = await _fetch_memory(text)
         if memory_ctx:
             parts.append(f"[Relevant memory context]\n{memory_ctx}\n[End memory context]")
-        cmd = ["claude", "--print", "--output-format", "text"]
-        if CLAUDE_CODE_MODEL:
-            cmd += ["--model", CLAUDE_CODE_MODEL]
+        cmd = ["claude", "--print", "--output-format", "text", *_model_args()]
         cwd = CLAUDE_CWD
         spawn_env = {}  # inherit the bridge's environment, as before
         shared_config = None
