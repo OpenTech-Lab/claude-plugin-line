@@ -6,7 +6,8 @@ services:
       POSTGRES_PASSWORD: linebot
       POSTGRES_DB: linebot
     ports:
-      - "5433:5432"
+      # Loopback only: the password is the public default above.
+      - "127.0.0.1:5433:5432"
     volumes:
       - pgdata:/var/lib/postgresql/data
     healthcheck:
