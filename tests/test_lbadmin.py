@@ -75,9 +75,26 @@ def api():
 
 
 @pytest.fixture
-def run(api):
+def home(tmp_path):
+    """An empty HOME, so a real ~/.config/lbadmin/token never leaks into a test."""
+    path = tmp_path / "home"
+    path.mkdir()
+    return path
+
+
+def write_token_file(home, value, mode):
+    path = home / ".config" / "lbadmin" / "token"
+    path.parent.mkdir(parents=True)
+    path.write_text(value, encoding="utf-8")
+    path.chmod(mode)
+    return path
+
+
+@pytest.fixture
+def run(api, home):
     def _run(*args, token=TOKEN):
         env = {k: v for k, v in os.environ.items() if not k.startswith("LINE_ADMIN_")}
+        env["HOME"] = str(home)
         env["LINE_ADMIN_URL"] = api.url
         if token is not None:
             env["LINE_ADMIN_TOKEN"] = token
@@ -115,10 +132,36 @@ def test_ids_are_encoded_as_single_path_segments():
 
 # --- end to end through the CLI ------------------------------------------------
 
-def test_missing_token_fails_clearly_without_calling_the_api(run, api):
+def test_missing_token_explains_how_to_create_and_save_one(run, api):
     result = run("tenants", "list", token=None)
     assert result.returncode == 1
-    assert "LINE_ADMIN_TOKEN is not set" in result.stderr
+    assert "Settings" in result.stderr
+    assert "install -m 600 /dev/stdin ~/.config/lbadmin/token" in result.stderr
+    assert api.requests == []
+
+
+def test_token_file_is_used_when_env_is_unset(run, api, home):
+    write_token_file(home, "  file-token-not-real\n", 0o600)
+    result = run("tenants", "list", token=None)
+    assert result.returncode == 0, result.stderr
+    assert api.last["headers"]["Authorization"] == "Bearer file-token-not-real"
+    assert "file-token-not-real" not in result.stdout + result.stderr
+
+
+def test_env_token_wins_over_token_file(run, api, home):
+    write_token_file(home, "file-token-not-real", 0o600)
+    result = run("tenants", "list")
+    assert result.returncode == 0, result.stderr
+    assert api.last["headers"]["Authorization"] == f"Bearer {TOKEN}"
+
+
+@pytest.mark.parametrize("mode", [0o640, 0o604])
+def test_group_or_world_readable_token_file_is_refused(run, api, home, mode):
+    path = write_token_file(home, "file-token-not-real", mode)
+    result = run("tenants", "list", token=None)
+    assert result.returncode == 1
+    assert f"chmod 600 {path}" in result.stderr
+    assert "file-token-not-real" not in result.stdout + result.stderr
     assert api.requests == []
 
 

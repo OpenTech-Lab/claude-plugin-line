@@ -73,3 +73,14 @@ CREATE TABLE IF NOT EXISTS pending_tenants (
   status       TEXT NOT NULL DEFAULT 'pending'
                  CHECK (status IN ('pending', 'approved', 'denied'))
 );
+
+-- Named API tokens for AI agents and scripts, created and revoked in Settings.
+CREATE TABLE IF NOT EXISTS api_tokens (
+  id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+  name          TEXT NOT NULL,
+  token_prefix  TEXT NOT NULL,
+  token_hash    TEXT NOT NULL UNIQUE,  -- sha256 hex of the full token
+  created_at    TIMESTAMPTZ DEFAULT now(),
+  last_used_at  TIMESTAMPTZ,
+  revoked_at    TIMESTAMPTZ
+);

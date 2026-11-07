@@ -1,9 +1,16 @@
 #!/usr/bin/env python3
 """lbadmin: command-line client for the LINE Bot Admin dashboard API.
 
-Configuration (environment):
+Configuration:
   LINE_ADMIN_URL    base URL of the dashboard (default http://localhost:3001)
-  LINE_ADMIN_TOKEN  the dashboard's ADMIN_API_TOKEN, sent as a Bearer token
+  LINE_ADMIN_TOKEN  an API token, sent as a Bearer token
+  ~/.config/lbadmin/token
+                    used when LINE_ADMIN_TOKEN is unset; must be chmod 600
+
+API tokens are created and revoked in the dashboard under Settings > API
+tokens (not from this CLI). Save a new token with:
+  mkdir -p ~/.config/lbadmin
+  install -m 600 /dev/stdin ~/.config/lbadmin/token   # paste, then Ctrl-D
 
 Responses are printed as pretty JSON. A non-2xx response prints the error
 body to stderr and exits 1.
@@ -35,10 +42,32 @@ def base_url():
     return os.environ.get("LINE_ADMIN_URL", DEFAULT_URL).rstrip("/")
 
 
+def token_file():
+    return os.path.join(os.path.expanduser("~"), ".config", "lbadmin", "token")
+
+
 def token():
-    value = os.environ.get("LINE_ADMIN_TOKEN", "")
+    """LINE_ADMIN_TOKEN if set, else the token file. Never echoes the token."""
+    value = os.environ.get("LINE_ADMIN_TOKEN", "").strip()
+    if value:
+        return value
+    path = token_file()
+    try:
+        with open(path, encoding="utf-8") as fh:
+            if os.fstat(fh.fileno()).st_mode & 0o077:
+                raise CliError(f"{path} is accessible by group or others; run: chmod 600 {path}")
+            value = fh.read().strip()
+    except FileNotFoundError:
+        value = ""
+    except OSError as err:
+        raise CliError(f"cannot read {path}: {err.strerror}") from None
     if not value:
-        raise CliError("LINE_ADMIN_TOKEN is not set; export it with the dashboard's ADMIN_API_TOKEN")
+        raise CliError(
+            "no API token: set LINE_ADMIN_TOKEN or save one to ~/.config/lbadmin/token.\n"
+            "Create a token in the dashboard under Settings > API tokens, then run:\n"
+            "  mkdir -p ~/.config/lbadmin\n"
+            "  install -m 600 /dev/stdin ~/.config/lbadmin/token   # paste, then Ctrl-D"
+        )
     return value
 
 

@@ -4,10 +4,12 @@ import './globals.css'
 import { useEffect, useState } from 'react'
 import Link from 'next/link'
 import { usePathname } from 'next/navigation'
-import { Geist } from 'next/font/google'
+import { Geist, Geist_Mono } from 'next/font/google'
 import { cn } from '@/lib/utils'
 
 const geist = Geist({ subsets: ['latin'], variable: '--font-sans' })
+// globals.css maps --font-mono to this variable.
+const geistMono = Geist_Mono({ subsets: ['latin'], variable: '--font-geist-mono' })
 
 function usePendingCount() {
   const [count, setCount] = useState(0)
@@ -31,11 +33,6 @@ function Sidebar() {
   function isActive(href: string) {
     if (href === '/') return pathname === '/'
     return pathname.startsWith(href)
-  }
-
-  async function logout() {
-    await fetch('/api/auth/logout', { method: 'POST' }).catch(() => {})
-    window.location.assign('/login')
   }
 
   const navLinks = [
@@ -77,31 +74,31 @@ function Sidebar() {
           )}
         </Link>
       </nav>
-      <div className="p-2 border-t border-slate-700">
-        <button
-          type="button"
-          onClick={logout}
-          className="w-full text-left px-4 py-2.5 text-sm rounded-md hover:bg-slate-700 transition-colors text-slate-300"
+      <div className="py-2 border-t border-slate-700">
+        <Link
+          href="/settings"
+          className={cn(
+            'flex items-center gap-2 px-4 py-2.5 text-sm rounded-md mx-2 my-0.5 hover:bg-slate-700 transition-colors text-slate-300',
+            isActive('/settings') && 'bg-slate-700 text-white font-medium'
+          )}
         >
-          Log out
-        </button>
+          Settings
+        </Link>
       </div>
     </aside>
   )
 }
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
-  // The login page renders bare: no sidebar, and no pending-count polling.
-  const bare = usePathname() === '/login'
   return (
-    <html lang="en" className={cn('font-sans', geist.variable)}>
+    <html lang="en" className={cn('font-sans', geist.variable, geistMono.variable)}>
       <head>
         <title>LINE Bot Admin</title>
         <meta name="viewport" content="width=device-width, initial-scale=1" />
       </head>
       <body>
-        {!bare && <Sidebar />}
-        <main className={cn('min-h-screen bg-slate-50', !bare && 'ml-56')}>{children}</main>
+        <Sidebar />
+        <main className="ml-56 min-h-screen bg-slate-50">{children}</main>
       </body>
     </html>
   )
